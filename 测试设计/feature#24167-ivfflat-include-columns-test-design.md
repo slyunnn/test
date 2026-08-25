@@ -33,7 +33,7 @@
 | 覆盖/下推优化 | 不适用 | 执行 | 计划符合门控，且结果等价于基线。 |
 | 查询模式 | 执行 | 执行 | 模式边界不改变既有语义；`include` 具备预期特化行为。 |
 | 生命周期与恢复 | 执行 | 执行 | 索引及 include 值全程一致。 |
-| 性能 | 基线记录 | 同数据对照 | 在正确性前提下记录原表 JOIN、耗时、扫描与索引规模。 |
+| 性能 | `mode=pre` / `mode=post` 基线 | `mode=include`（过滤列必须 INCLUDE） | 使用同一 ANN-Benchmark 数据和过滤选择性，对比 Recall、延迟、扫描/候选行数、JOIN 与索引空间。 |
 
 ### 1.3 覆盖范围
 
@@ -44,8 +44,8 @@
 | 一致性与并发 | 10 | INSERT/UPDATE/DELETE、事务、并发、REINDEX |
 | ALTER/异常 | 8 | 列变更、非法输入、序列化、回退与安全性 |
 | 恢复与兼容 | 6 | snapshot、备份恢复、升级和旧索引 |
-| 性能与可观测性 | 7 | 规模、Top-K、过滤选择性、轮次 explain |
-| **合计** | **60** |  |
+| 性能与可观测性 | 12 | ANN-Benchmark 的 pre/post/include 对比、规模、Top-K、过滤选择性、轮次 explain |
+| **合计** | **65** |  |
 
 ### 1.4 参考资料
 
@@ -138,7 +138,7 @@
 | IVFIC-052 | 兼容 | 旧逗号格式元数据 | 注入历史逗号分隔 include 值并加载 | 解析回退兼容，SHOW/查询正确。 |
 | IVFIC-053 | 失败恢复 | 建索引/恢复中断 | DDL 失败、节点重启或任务中断后重试 | 无半成品隐藏表/脏元数据；重试可成功。 |
 
-### 2.6 性能与可观测性（7 条）
+### 2.6 性能与可观测性（12 条）
 
 | 编号 | 二级模块 | 测试场景 | 测试步骤 | 预期结果/记录项 |
 | --- | --- | --- | --- | --- |
@@ -149,6 +149,42 @@
 | IVFIC-058 | 多轮 | 不重叠 bucket window | 强制至少三轮，采集内部 SQL/trace | bucket 窗口连续且不重叠，pk 去重后无重复输出。 |
 | IVFIC-059 | Explain | 默认 EXPLAIN ANALYZE 摘要 | 运行多轮 include 查询 | 展示 round_count、bucket_windows、round_limits、empty_rounds、输出统计；不无限展开。 |
 | IVFIC-060 | Explain | VERBOSE 展开上限 | 对大量轮次执行 verbose analyze | 前 N/后 M 轮可查看，中间轮折叠；输出规模受控且含摘要。 |
+| IVFIC-061 | ANN-Benchmark | `mode=pre` 基线 | 载入固定 ANN-Benchmark 数据集和查询集；使用不含 INCLUDE 的 `idx_pre`，以过滤列谓词执行 pre 模式 | 记录 Recall@K、p50/p95/p99、QPS、entries 候选数、原表扫描/Join 输入及资源；结果满足精确过滤基线。 |
+| IVFIC-062 | ANN-Benchmark | `mode=post` 基线 | 在同一数据快照上使用不含 INCLUDE 的 `idx_post`，执行相同过滤谓词和 post 模式 | 使用与 IVFIC-061 相同 K、probe、并发、warm-up 和查询序列；记录同一指标。 |
+| IVFIC-063 | ANN-Benchmark | `mode=include` 对照 | 在隔离表/索引上创建 `idx_include ... INCLUDE (filter_col)`，以同一谓词和 include 模式执行 | EXPLAIN 显示过滤列从 entries 读取并下推；按覆盖情况避免或缩小原表 JOIN；结果满足精确过滤基线。 |
+| IVFIC-064 | ANN-Benchmark | 过滤选择性矩阵 | 对 1%、10%、50%（及无过滤）选择性重复 pre/post/include | 每个单元均报告 Recall/延迟/候选数；include 的优势只在过滤列已 INCLUDE 时判定。 |
+| IVFIC-065 | ANN-Benchmark | 索引代价与结果稳定性 | 对 `idx_pre`、`idx_post`、`idx_include` 记录建索引时间、entries 大小；多次随机化查询顺序重复 | include 的额外空间/构建代价可量化；三模式不出现过滤错误、少返回或结果漂移。 |
+
+#### 2.6.1 ANN-Benchmark 模式对比执行规范
+
+性能结论必须基于 ANN-Benchmark（`ann-benchmarks`）格式的固定 base/query/ground-truth 数据集；建议至少覆盖一个中等规模欧氏距离数据集和一个接近目标业务维度/规模的数据集。若使用公开数据集，记录数据集名称、原始文件校验和、维度、base/query 数、距离度量和 ground-truth 版本；若使用内部转换数据，转换脚本、随机 seed 和产物校验和同样必须归档。
+
+| 项目 | `mode=pre` | `mode=post` | `mode=include` |
+| --- | --- | --- | --- |
+| 索引定义 | `idx_pre`：仅向量 key，不含过滤列 | `idx_post`：仅向量 key，不含过滤列 | `idx_include`：向量 key，**`INCLUDE (filter_col)`**；多个过滤列须全部列入 INCLUDE。 |
+| 查询数据 | 与其他列完全相同 | 与其他列完全相同 | 与其他列完全相同。 |
+| 查询谓词 | `WHERE filter_col = :value` | `WHERE filter_col = :value` | `WHERE filter_col = :value`，谓词列必须正是 INCLUDE 列。 |
+| 模式 | 显式 `mode=pre` | 显式 `mode=post` | 显式 `mode=include`。 |
+| 公平性约束 | 同一 lists/probe、K、LIMIT/OFFSET、会话变量、并发和查询顺序。禁止复用 include 索引。 | 同左。 | 同左；只允许因 INCLUDE entries 结构产生的计划差异。 |
+| 正确性基线 | 对每个查询先按 filter 精确过滤，再全表计算 exact Top-K。 | 同左。 | 同左。 |
+
+推荐建模方法：为每条 base vector 以固定 seed 生成低/中/高选择性的 `filter_col`（例如 `category`）；每一条 benchmark query 使用同一 filter value 运行三种模式。为避免同一表上多个 IVF 索引导致优化器选错，三模式应在内容完全相同的独立表上执行，或在每次运行前仅保留目标索引。`mode=include` 的索引创建 DDL 必须显式包含过滤列，例如：
+
+```sql
+CREATE INDEX idx_include ON ann_include (vec)
+  USING IVFFLAT LISTS <lists> OP_TYPE 'vector_l2_ops'
+  INCLUDE (category);
+```
+
+每种模式在 warm-up 后至少运行 3 轮；轮次之间随机化 query 顺序，并报告每轮及汇总结果。查询使用产品实际支持的 rank option 语法显式指定相应 mode；记录原始 SQL 和 EXPLAIN ANALYZE，避免以客户端默认 mode 代替被测模式。
+
+| 必录指标 | 说明 |
+| --- | --- |
+| Recall@1/@10/@100、返回行数 | 与“先过滤、再 exact Top-K”的 ground truth 比较；返回不足必须标为正确性失败。 |
+| 延迟与吞吐 | 单查询 p50/p95/p99、QPS、warm-up 与测量轮次分别记录。 |
+| 执行代价 | entries 扫描/候选数、原表扫描/Join 输入、round count、bucket windows、CPU/内存/磁盘 I/O。 |
+| 索引代价 | 建索引时间、entries 表大小、总索引大小、include 相对无 include 的增量。 |
+| 计划证据 | `mode=pre/post/include`、过滤下推、是否 Index-Only/Join、residual filter 必须由 EXPLAIN/ANALYZE 证明。 |
 
 ## 3. 基线对照与判定
 
