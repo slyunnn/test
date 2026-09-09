@@ -50,7 +50,7 @@
 | 资料 | 地址 |
 | --- | --- |
 | Feature 与用户验收示例 | <https://github.com/matrixorigin/matrixone/issues/25026> |
-| IVF INCLUDE 测试设计模板 | <https://github.com/slyunnn/test/blob/main/%E6%B5%8B%E8%AF%95%E8%AE%BE%E8%AE%A1/feature%2325144-ivfflat-include-columns-test-design.md> |
+| IVF INCLUDE 测试设计模板 | <https://github.com/slyunnn/test/blob/main/%E6%B5%8B%E8%AF%95%E8%AE%BE%E8%AE%A1/feature%2324167-ivfflat-include-columns-test-design.md> |
 
 ## 2. 测试用例
 
