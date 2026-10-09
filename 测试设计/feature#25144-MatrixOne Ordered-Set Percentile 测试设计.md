@@ -155,10 +155,23 @@
 | PCT-R054 | 高基数 group | 固定总行数，提高 group cardinality | 无 OOM；逐 group 抽样 Oracle 正确。 |
 | PCT-R055 | 数据倾斜 | 一个超大 group + 多小 group | 无饥饿/失败，记录长尾与 spill。 |
 | PCT-R056 | 并发 | 10/50/100 并发查询集 | 无错误/panic/OOM；记录 QPS、p50/p95、资源。 |
-| PCT-R057 | 长稳 | 多 CN 混合查询持续 2 小时 | 无持续内存/临时文件增长、CN 重启或结果漂移。 |
+| PCT-R057 | 长稳 | 多 CN 下以固定 cadence 轮换 BIGINT/DOUBLE/DECIMAL、ASC/DESC 与至少一条强制 spill 查询；完整专项持续 2 小时 | 结果始终符合独立 Oracle；无 CN 重启、临时文件/已删除 FD 残留或结果漂移；记录资源时间序列，不以单次 RSS 差值单独判定泄漏。 |
 | PCT-R058 | exact/approx 对照 | 同一固定数据执行 exact 和 approximate p95/p99 | exact 作真值；记录 approx 误差和双方资源，不要求相等。 |
 | PCT-R059 | spill 成本 | 内存可容与强制 spill 的同一快照 | 记录耗时/资源差异；结果完全一致。 |
 | PCT-R060 | 并行度 | 固定数据改变 CN 数与并行度 | 逻辑结果不变；记录吞吐、merge 成本。 |
+
+### 4.1 PCT-R057 分层执行与资源判定
+
+PCT-R057 的 2 小时用于发现跨多次 aggregate/Free、spill 文件与远程 fragment 清理的**累积**问题；它不是 R056 并发压测的替代品。因此按以下两层运行：
+
+| 层级 | 频率与时长 | 工作负载 | 判定边界 |
+| --- | --- | --- | --- |
+| 日常核心哨兵 | 常规 main Nightly；不超过 30 分钟 | 执行除 R057 soak 外的固定 10M scale、并发、spill、取消和混合生命周期检查 | 及时发现正确性、重启、明显临时文件残留或回归；**不能替代** R057 完整通过。 |
+| 完整长稳 | 每周至少一次；2 小时 | 每 120 秒开始一条查询，轮换 BIGINT spill ASC、BIGINT DESC、DOUBLE ASC、DECIMAL DESC；记录每类执行次数、p50/p95 与 Oracle 校验 | 每类至少有 10 次成功执行；无结果漂移/CN 重启；资源和文件证据满足下述规则。 |
+
+- 采集开始、每 5 分钟、结束时的 Pod working set；开始和结束同时采集实际 `mo-service` 进程的 FD、`(deleted)` 文件、goroutine 与可用服务内存指标。
+- 服务可报告的 mpool/heap 等同口径指标出现跨采样持续单调增长且静置后不回落时，判为疑似资源问题并保留原始证据；单轮 RSS/working-set 差异只能作为诊断信息，不能单独下“泄漏”结论。
+- R056 已负责 10/50/100 并发和 QPS，不要求 R057 以无间隔全速扫描占满 CN；固定 cadence 保留长期观察窗口，同时避免把长稳专项误用为持续吞吐压测。
 
 ## 5. Oracle 与结果判定
 
