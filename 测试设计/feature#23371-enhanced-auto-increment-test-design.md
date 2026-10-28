@@ -1,8 +1,10 @@
-# MatrixOne Enhanced AUTO_INCREMENT 测试设计
+# MatrixOne Enhanced AUTO_INCREMENT 测试设计（必要项评审版）
 
 > 本设计覆盖 Feature [#23371](https://github.com/matrixorigin/matrixone/issues/23371)：增强 AUTO_INCREMENT，支持修改起始值、`AUTO_ID_CACHE` 表选项，以及 `auto_increment_increment` / `auto_increment_offset` 会话变量。核心目标是在分布式环境中保证 ID 唯一、序列语义明确、缓存可控且与既有表兼容。
 
 > 2026-10-09 研发 review 修订：以已合入 [PR #28528](https://github.com/matrixorigin/matrixone/pull/28528)、合入提交 `2b56f0d5e11b7af0b29cf91bd1d0f03430da3f75` 为契约基线。本 PR 主要新增表级 AUTO_ID_CACHE；ALTER 起点和 session 序列复用上游能力并验证组合行为。本文为测试设计与已有测试映射，不代表本轮已执行 UT/BVT 或性能测试。
+
+> 2026-10-28 必要项评审：75 条收敛为 41 个执行单元。保留研发 review 的全部确定语义与发布边界；原编号不重排。以改动路径为单位复用 UT/BVT，不要求每条用例交叉跑完整单/多 CN 矩阵。
 
 ## 1. 测试原则
 
@@ -12,7 +14,7 @@
 | DDL 原子性 | ALTER 起始值、schema 演进、建表/恢复失败不得留下部分元数据；本期不支持 ALTER AUTO_ID_CACHE。 |
 | 会话隔离 | increment/offset 必须严格按 session 生效；不同 session 可并发使用不同设置，不能相互泄漏。 |
 | 兼容性 | 不显式使用新语法的既有 AUTO_INCREMENT 表保持原有默认行为；MySQL 兼容语义的差异须冻结并记录。 |
-| 分布式验证 | ID 分配依赖分布式 counter 和本地 cache，所有核心用例须覆盖单 CN 与多 CN，且以全局唯一性和最终序列规则判定。 |
+| 定向分布式验证 | 分配唯一性、session隔离/序列和已提交观察必须有多CN直接证据；DDL参数矩阵不重复全拓扑。不得仅凭主键去重后行数推断分配安全。 |
 | 结果与状态双校验 | 除 INSERT 结果外，检查 SHOW CREATE、系统元数据、重连/重启后的下一 ID、执行计划/日志中的 cache 分配证据（可获得时）。 |
 
 ### 1.1 基本信息
@@ -28,34 +30,29 @@
 | 关键对象 | AUTO_INCREMENT 列、表级 counter 元数据、分布式 ID cache、session 变量。 |
 | 主要风险 | 自动发号冲突/写入丢失、显式值推进错误、水位与候选值混淆、cache策略失效、观察陈旧、DDL/DML原子性、恢复后序列漂移。 |
 
-### 1.2 执行矩阵
+### 1.2 执行分层
 
-| 测试类型 | 单 CN | 多 CN | 通过标准 |
-| --- | --- | --- | --- |
-| DDL/元数据 | 执行 | 执行 | 定义、SHOW、错误与计数器状态一致。 |
-| 默认生成/显式插入 | 执行 | 执行 | 唯一、步长/offset 正确，无不可解释冲突。 |
-| Session 变量 | 执行 | 执行 | 每 session 独立且序列满足公式。 |
-| Cache/并发 | 执行 | 必须执行 | 全局无重复；cache 间隙、性能与失效可解释。 |
-| 事务/恢复/升级 | 执行 | 执行 | 状态持久、恢复正确，旧表兼容。 |
-| 性能/长稳 | 基线 | 必须执行 | 吞吐稳定，无计数器热点、泄漏或 CN 异常。 |
-| 开关/重启 | 独占集群执行 | 全 CN 配置一致 | 默认关闭、开启→关闭→开启；保留数据/策略，拒绝路径无残表。 |
-| 观察/事务可见性 | UT + SQL | 必须执行 | 不耗号，读到事务自身状态和跨 CN 已提交新状态；取消/屏障错误不伪成功。 |
-| 协议门禁 | 本地/发送端/接收端 UT | 同版本功能集成 | V80 拒绝、V81 接受（开关开启）；禁用仍拒绝非零策略。不得据此声明混合版本可运行。 |
+| 层级 | 必须验证 | 不扩大为 |
+| --- | --- | --- |
+| SQL/BVT | 参数、精确ID、SHOW、事务与生命周期 | 所有普通DML/权限/CDC/PITR回归 |
+| allocator/store UT | 请求跨度、按需分配、屏障、门禁、策略重绑 | 用吞吐或SHOW结果推断内部正确 |
+| 多CN集成 | 027/038/042写入对账、069即时观察、冷加载 | 所有DDL与类型参数的全拓扑笛卡尔积 |
+| 独占重启集群 | 040及061..066开关/升级边界 | 混合版本或带非零策略表原地降级支持 |
 
-### 1.3 覆盖范围
+### 1.3 必要覆盖与精简说明
 
-| 一级模块 | 用例数 | 主要覆盖内容 |
+| 一级模块 | 执行单元 | 合并与范围 |
 | --- | ---: | --- |
-| DDL 与元数据 | 12 | ALTER 起始值、建表 option、SHOW、非法参数、schema 变更 |
-| 默认 ID 与显式插入 | 11 | 起始/边界、批量、NULL/0、手工值、类型 |
-| Session increment/offset | 10 | 序列公式、隔离、切换、非法变量、复制式分配 |
-| Cache、并发与分布式 | 11 | cache 大小、分配、CN 重启、并发、热点 |
-| 事务、恢复与兼容 | 9 | commit/rollback、backup/PITR、升级、rename/truncate |
-| 异常、性能与可观测性 | 7 | DDL/DML 故障、性能、长稳、诊断 |
-| 发布开关与协议边界 | 6 | 默认关闭、重启、维护例外、V81、全量升级 |
-| 观察、生命周期与语法补充 | 7 | 不耗号、事务/跨 CN、临时表、DUMP/LOAD、语法拒绝 |
-| 元数据性能与策略传递 | 2 | 共享观察屏障、物理表 ID 绑定与回退 |
-| **合计** | **75** | 保留原 AINC-001..060 编号，新增 061..075；一条用例的参数组合分别执行。 |
+| DDL与元数据 | 7 | 起点提高/重复设置并入006；SHOW随DDL/观察检查 |
+| 默认ID与显式输入 | 5 | 自动写法/批量归014；显式低/高值归018；类型上限归020 |
+| Session序列 | 5 | 步长/offset/default归025；隔离/多CN归027 |
+| Cache与并发 | 6 | 续租归035；跨表归036；跨CN分片归038 |
+| 事务与复制生命周期 | 3 | commit/rollback/savepoint归046；逻辑导出048；各复制路径052 |
+| 开关与发布边界 | 6 | 保留061..066全部确定预期 |
+| 观察、语法及策略传递 | 9 | 保留067..075，074只保留共享frontier正确性UT |
+| **合计** | **41** | 保留编号间隙；一个owner内的独立入口仍逐项记录 |
+
+删除独立性能/热点/2小时长稳、PITR/CDC、通用权限、LAST_INSERT_ID及泛化故障矩阵，不在附录追加必跑项。失败数据原子性、CN重启安全和完整写入对账保留；038/042用有界并发，不做压力验收。旧表默认兼容由002/061/066覆盖。
 
 ### 1.4 参考资料
 
@@ -85,101 +82,62 @@ enable-auto-id-cache = true
 
 ## 2. 测试用例
 
-### 2.1 DDL 与元数据（12 条）
+### 2.1 DDL 与元数据（7 个执行单元）
 
 通用表：`t(id BIGINT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(50))`；需同时覆盖有/无历史数据、单列/复合约束兼容表和不同整数宽度的 AUTO_INCREMENT 列。
 
 | 编号 | 二级模块 | 测试场景 | 测试步骤 | 预期结果 |
 | --- | --- | --- | --- | --- |
-| AINC-001 | CREATE | 默认 AUTO_INCREMENT 回归 | 不带新选项建表并连续插入 | 默认起始、连续性和 SHOW 与变更前一致。 |
 | AINC-002 | CREATE | CACHE 合法值 | 省略、0、1、2、8、1000000 分别建表，冷 CN 加载后 SHOW/写入 | 省略/0 继承 CN 默认，SHOW 省略零选项；正数持久且 SHOW 如实呈现，冷加载仍遵循表策略。 |
 | AINC-003 | CREATE | 起始值 + cache | 默认 session、CACHE=1，分别以 AUTO_INCREMENT=0、10 建新表并插入；inc=3/off=2 时以起点10建表 | 起点0合法，默认 session 首值1；起点10首值10；inc=3/off=2 生成11、14、17。session 参数不持久化为表策略。 |
-| AINC-004 | ALTER | 空表提高起始值 | 默认 session、CACHE=1，`ALTER TABLE t AUTO_INCREMENT = 1000` 后插入 | 首值1000，后续1001；策略保留。 |
-| AINC-005 | ALTER | 有数据提高起始值 | 已生成 ID 后改为更大值，插入多行 | 后续 ID 不低于目标值且无重复。 |
-| AINC-006 | ALTER | 低于现存最大值/预留水位 | 默认 session，构造现存最大ID=200及高于200的预留水位；ALTER起点100后插入 | ALTER成功，下一值201；分别记录M/H/N，允许显式ALTER重置预留水位，不以旧H作为下一值下界。 |
-| AINC-007 | ALTER | 等于当前/重复 ALTER | 多次设置相同或临界值 | 幂等/错误语义明确，counter 不意外跳变。 |
-| AINC-008 | 元数据 | 定义与下一值分开检查 | SHOW CREATE检查持久策略；SHOW TABLE STATUS和information_schema.tables检查下一值；执行067..070 | 正数策略保真、0省略；CACHE=1空表重复观察不预留号段；不能只验证插入后SHOW。 |
+| AINC-006 | ALTER | 起点提高、重复与低于M/H | 默认session、CACHE=1/8：空表ALTER1000→首值1000；有数据提高；重复ALTER；独立表构造M=200、H>200，再ALTER100 | 默认session低设100成功且下一值201；提高后不低于目标、无重复；重复设置状态一致。记录M/H/N，允许显式重置H；保留CACHE，不以旧H作为下界。 |
 | AINC-009 | 约束 | 无自增列/多个自增列 | 普通/临时表无自增列时分别指定CACHE=0/1；建立含两个可见自增列的表并混合显式/自动写入 | 无自增列CACHE=0成功、非零拒绝且无残表；多个自增列合法，各列独立分配且遵循同一表级策略。 |
 | AINC-010 | 参数 | CACHE非法值与起点边界分离 | CACHE=-1、1.5、1000001、重复选项及uint64溢出；另测起点0/合法上界/超列类型上界 | 非法CACHE拒绝、不截断、不留残表；CACHE=0和建表起点0是正向控制。起点测试分别记录DDL接受与发号溢出，不把两阶段错误混同。 |
 | AINC-011 | DDL 原子性 | ALTER 与并发 DML | 一边 ALTER、一边 INSERT/SELECT | DDL/DML 遵循锁与原子性；无重复/半更新状态。 |
 | AINC-012 | Schema 演进 | 删除/保留/转移自增属性 | CACHE=0/1/8，DROP最后一个自增列、MODIFY去掉最后一个自增属性；对照保留、转移属性及多自增列仅删除一列 | 最终无可见自增列时成功且策略归0，SHOW无CACHE，普通数据保留；最终仍有自增列则保留策略、后续各列安全发号。 |
 
-### 2.2 默认 ID 与显式插入（11 条）
+### 2.2 默认 ID 与显式插入（5 个执行单元）
 
 | 编号 | 二级模块 | 测试场景 | 测试步骤 | 预期结果 |
 | --- | --- | --- | --- | --- |
-| AINC-013 | 基础 | 单行自动生成 | 多次 `INSERT(v)` | ID 唯一，默认递增规则正确。 |
-| AINC-014 | 批量 | 多行 VALUES/INSERT SELECT | 单语句插入多行、空结果 INSERT SELECT | 每个实际插入行获得唯一 ID；顺序/间隙符合分配契约。 |
-| AINC-015 | 默认值 | NULL/DEFAULT/省略 id | 用三种写法插入 | 所有合法写法触发自动生成，语义一致。 |
-| AINC-016 | 零值 | 显式 0 | 插入 `id=0`（受 SQL mode 影响时覆盖配置） | 行为符合 MatrixOne 冻结规则，不与自动 ID 混淆。 |
-| AINC-017 | 手工值 | 低于当前 ID | 插入未占用低值后自动插入 | 手工行成功/失败按 PK 规则；counter 不错误回退。 |
-| AINC-018 | 手工值 | 显式高值推进 | 默认session、CACHE=1新表先插入显式100，再自动插入；另测负数控制 | 后续自动值101；负数不推进水位；自动生成不与已存在显式ID冲突。 |
+| AINC-014 | 自动输入 | 单/多行、空输入和默认写法 | CACHE=0/1/8执行单行、多行VALUES、INSERT SELECT及空结果；对照省略id、NULL、DEFAULT及显式0的实际SQL mode契约 | 每个实际自动行唯一；空SQL输入不申请自动号段；合法默认写法一致。0按已冻结产品规则判定，不擅自与NULL等价。CACHE=1精确跨度由034证明。 |
+| AINC-018 | 显式输入 | 低值、高值与负值 | 独立CACHE=1表，插入显式100再自动；另从有数据表插入未占用低值、负值再自动；与非默认session组合见031/042 | 默认新表100后生成101；低/负显式值不使水位错误回退或推进；显式键按约束校验。自动发号不与现存值冲突。 |
 | AINC-019 | 冲突 | 已存在显式 ID | 插入重复主键、随后自动插入；记录错误、数据和分配事件 | 重复键明确报错，失败语句数据原子性正确；后续自动发号安全。允许已申请共享号段产生gap，不要求失败退还或回滚counter。 |
-| AINC-020 | 类型 | TINYINT/INT/BIGINT 有符号/无符号 | 各类型接近上限插入 | 边界生成与溢出错误正确；无回绕。 |
+| AINC-020 | 类型边界 | 有/无符号整数及耗尽续租 | 复用类型BVT，在合法整数类型上验证边界/溢出；以一个窄类型在CACHE>1下跨续租逼近上限 | 合法值不回绕/重复；超过类型范围稳定报错，服务可继续处理健康表；不再为各类型重复多CN压力。 |
 | AINC-021 | 删除 | DELETE/TRUNCATE 后生成 | 默认session、CACHE=1/8，删除最高值、DELETE全表、TRUNCATE后重插；检查SHOW | DELETE不重置发号；TRUNCATE后首值1且保留CACHE。TRUNCATE按隐式提交验证，不要求外层ROLLBACK撤销它。 |
-| AINC-022 | 多表 | 多 auto 表独立性 | 并发写入多个不同配置表 | counter/cache 完全隔离。 |
-| AINC-023 | 查询 | LAST_INSERT_ID/返回值（支持时） | 单行/批量/失败插入后读取 | 返回本 session 正确生成 ID，不受其他 session 干扰。 |
 
-### 2.3 Session increment 与 offset（10 条）
+### 2.3 Session increment 与 offset（5 个执行单元）
 
 令 `inc = auto_increment_increment`、`off = auto_increment_offset`；变量各自合法时，`effective_off = off > inc ? 1 : off`。仅自动生成行应满足 `id ≡ effective_off (mod inc)`，首项还受起点、现存数据及可用号段约束。显式ID不参与同余检查；并发/续租允许跳项，不能要求所有相邻结果差固定为inc。
 
 | 编号 | 二级模块 | 测试场景 | 测试步骤 | 预期结果 |
 | --- | --- | --- | --- | --- |
-| AINC-024 | 默认 | 默认变量值 | 新 session 查询变量并插入 | 默认值与兼容定义一致。 |
-| AINC-025 | increment | inc=2/3/大值 | 设置 inc，连续/批量插入 | 序列步长与同余关系正确，ID 唯一。 |
-| AINC-026 | offset | offset=1..inc | 固定 inc，切换合法 offset 插入 | 每个 session 返回满足其 offset 的序列。 |
-| AINC-027 | 组合 | 不同 session 不同 inc/off | 两 session 交替/并发插入同表 | 所有 ID 全局唯一；各 session 的生成值符合各自设置。 |
+| AINC-025 | 序列 | 默认与合法inc/off矩阵 | 新session记录默认值；独立CACHE=1表分别设置inc=2/3/合法大值及off=1/中间/inc，连续/批量写入 | 默认1/1；自动行满足有效offset同余，单writer精确fixture符合序列。不同session/续租可跳项，不要求全局相邻差固定。 |
+| AINC-027 | session隔离/多CN | 不同序列及连接生命周期 | CN-A/B各自建立连接、设置不同inc/off并交替写同表；切换/重连新session，若连接池有显式reset则验证该入口 | 自动ID全局唯一且符合各writer变量；新连接恢复默认，现有连接不泄漏设置。记录真实连接路由，不假定同一TCP session可跨CN迁移。 |
 | AINC-028 | 切换 | session 内动态 SET | 先默认插入，再 SET inc/off 并继续插入 | 切换仅影响后续分配；无重复或错误回退。 |
-| AINC-029 | 隔离 | 连接池/重连 | 设置变量后重连、新开 session、复用连接 | session 生命周期和 reset 行为符合产品契约，无变量泄漏。 |
 | AINC-030 | 参数 | 非法范围与offset归一化 | 分别测试变量自身非法范围/类型；独立新表设置inc=3/off=5后插入三个NULL | 各自合法范围内off>inc可设置，生成时有效offset=1，得到1、4、7；真正非法输入按变量定义报错，不能把off>inc归入拒绝组。 |
-| AINC-031 | DDL 交互 | ALTER起始值 + inc/off | 独立空表、CACHE=1，ALTER起点10后，分别在inc=3/off=2和inc=3/off=5下写入 | 首值分别11和10；候选满足有效offset与ALTER后的数据/分配边界，不使用ALTER前预留高水位作为下界。 |
-| AINC-032 | 手工值交互 | 显式高 ID + inc/off | 手工插入后由多个 session 自动插入 | 不违反各 session 序列或全局唯一约束。 |
-| AINC-033 | 多 CN | session 变量跨 CN | 同 session/不同 session 经不同 CN 写入 | 会话设置正确传递；不因路由改变失效。 |
+| AINC-031 | 组合 | ALTER与显式高值后的inc/off | 独立CACHE=1空表ALTER10，分别inc=3/off=2和inc=3/off=5；另插显式高ID再自动 | ALTER10后首值分别11和10；高值后自动候选高于现存边界且满足effective_off；不沿用ALTER前H作下界。 |
 
-### 2.4 Cache、并发与分布式（11 条）
+### 2.4 Cache、并发与分布式（6 个执行单元）
 
 | 编号 | 二级模块 | 测试场景 | 测试步骤 | 预期结果 |
 | --- | --- | --- | --- | --- |
 | AINC-034 | cache | CACHE=1真实需求分配 | UT记录分配调用/原始跨度，覆盖构造、空输入、全显式、估算、低水位、并发等待者；SQL混合(NULL,100,NULL) | 前述无自动需求路径不申请自动号段；显式高值必要水位推进另计。混合结果1、100、101；不因估算/低水位/等待者扩大预留；精确断言见§3.3。 |
-| AINC-035 | cache | CACHE>1原始跨度 | CACHE=2/8，大于基础跨度的实际批量需求；默认及inc=3/off=2分别检查分配记录 | CACHE为基础原始数值跨度，不是固定生成行数；需求大可扩大；覆盖CN默认跨度；非默认session无后台预取。性能单列055，不替代分配断言。 |
+| AINC-035 | cache | CACHE>1跨度及耗尽续租 | CACHE=2/8，默认及inc=3/off=2，构造批量需求大于基础跨度并跨多个号段，UT记录请求/预取事件 | CACHE是基础原始数值跨度而非固定生成行数；需求可扩大，覆盖CN默认跨度；非默认session即使CACHE>1仍无后台预取。续租区间不重叠、无重复。 |
 | AINC-036 | cache | 不同表 cache 隔离 | 同时写入 cache 不同的多表 | 每表配置独立，不能借用/污染其他计数器。 |
-| AINC-037 | cache | cache 耗尽/续租 | 单 CN 插入超过多个 cache 区间 | 新 cache 无重叠、无重复；边界无性能异常。 |
-| AINC-038 | 多 CN | 多 CN 并发 INSERT | 无预期冲突场景，记录每行writer_id/request_id、计划行数、提交结果和ID；核对§3.1 | 全部计划写入成功且实际行数=预期行数；自动分配duplicate-key为0；逐请求无丢失/重复，唯一性等式仅为附加检查。 |
-| AINC-039 | 多 CN | cache 分片 | 各 CN 获取 cache 后交替插入 | 分配区间不重叠；允许全局物理顺序交错。 |
+| AINC-038 | 多CN分配 | 并发与交替消费预留号段 | A/B各预留cache、交替及有界并发写同表，跨续租；记录writer_id/request_id、计划行数、提交结果和ID | 全部计划写入成功且实际行数=预期；自动duplicate-key为0，逐请求不丢不重，各CN号段不重叠。允许全局顺序交错，唯一性等式仅附加检查。 |
 | AINC-040 | 故障 | CN 重启/切换 | cache 已预留但未用尽时重启 CN，再写入 | 已发 ID 不复用；未用 cache 的 gap 符合持久化策略。 |
-| AINC-041 | 故障 | TN/元数据短暂不可用 | 在分配/续租时故障注入后恢复 | 明确重试/错误；恢复后无重复或 counter 损坏。 |
-| AINC-042 | 并发 | INSERT 与显式高值竞争 | 高并发自动插入期间插入高显式 ID | 无 duplicate key 风暴、死锁或不可恢复的 counter 跳变。 |
-| AINC-043 | 热点 | 单表热点与多表分散 | 比较同总 QPS 下单表/多表写入 | 记录吞吐/延迟；热点不造成 CN 异常或无限重试。 |
-| AINC-044 | 可观测性 | 观察副作用与诊断 | 执行067..070及074，关联物理表ID、列、M/H/N、CN、事务、分配事件 | 观察不发号，私有/已提交事务路径正确；跨CN值及时可见，取消/屏障失败退出；保留可定位证据。 |
+| AINC-042 | 并发交互 | 自动写与显式高值/ALTER竞争 | 有界并发自动写期间，一次插入未占用显式高ID；独立阶段按011交错ALTER；按每条语句inc/off核对 | 无自动分配duplicate-key、死锁或旧cache跨epoch使用；计划/成功/失败/实际行逐项对账。显式行不检查同余，故障未知提交不得盲重试。 |
 
-### 2.5 事务、恢复与兼容（9 条）
+### 2.5 事务与复制生命周期（3 个执行单元）
 
 | 编号 | 二级模块 | 测试场景 | 测试步骤 | 预期结果 |
 | --- | --- | --- | --- | --- |
-| AINC-045 | 事务 | commit | 事务内插入多行后 COMMIT | 数据和已分配 ID 可见，next-id 正确前进。 |
-| AINC-046 | 事务 | rollback | 插入后ROLLBACK，再插入并记录号段 | 回滚行不可见；共享号段不随业务事务回滚，允许gap；后续成功且无冲突，不要求ID连续。 |
-| AINC-047 | 事务 | savepoint/失败语句 | 部分失败、savepoint回滚后继续写 | 数据遵循回滚边界，允许已预留号段间隙；无自动发号冲突/卡死，不要求counter与数据同步回退。 |
-| AINC-048 | 备份恢复 | 逻辑导出/恢复 | 默认session、CACHE=1表写入1，导出DDL和数据后恢复；另执行072的DUMP/LOAD | 正数CACHE被导出并恢复，数据1保留，下一自动值2；0策略保持默认。不以逻辑导出替代DUMP TABLE/LOAD TABLE。 |
-| AINC-049 | Snapshot/PITR | 多次 ALTER/DML 后恢复到不同时间点 | 每恢复点后插入并检查 ID | counter 与恢复点数据一致；不与现存行冲突。 |
-| AINC-050 | 升级 | 旧表兼容与全量升级 | 升级前创建无新option表，按066停旧进程并升级全部角色；关闭/开启时验证旧表 | 旧表等价CACHE=0，默认行为兼容；记录全部角色版本与配置。带非零策略表不做原地降级成功验收。 |
-| AINC-051 | 复制/订阅 | CDC/订阅（支持时） | 写入 auto 表、恢复/消费目标端 | 主从/订阅语义不产生 ID 重写或冲突。 |
+| AINC-046 | 事务 | commit、rollback及savepoint/失败语句 | 独立CACHE=1/8表写多行后分别COMMIT/ROLLBACK；已支持的savepoint部分回滚或失败后继续写入 | 数据遵循事务边界；共享号段不随业务事务回滚，允许gap；后续成功且无冲突，不要求counter与数据同步回退。 |
+| AINC-048 | 备份恢复 | 逻辑导出/恢复 | 默认session、CACHE=1表写入1，导出DDL和数据后恢复；物理DUMP/LOAD另按072执行 | 正数CACHE被导出并恢复，数据1保留，下一自动值2；0策略保持默认。不以逻辑导出替代DUMP TABLE/LOAD TABLE。 |
 | AINC-052 | 复制/重命名 | RENAME、LIKE、CLONE、COPY独立路径 | 默认session、CACHE=1、最大ID=200；独立副本执行RENAME、CREATE TABLE dst LIKE src、CREATE TABLE dst CLONE src、ALTER TABLE src ADD COLUMN extra INT, ALGORITHM=COPY | 各路径保留CACHE；RENAME/COPY保留数据、下一值201；LIKE为空表、首值1；CLONE复制数据、下一值201。每条路径独立验收，CTAS不能代替CLONE。 |
-| AINC-053 | 权限 | SET/ALTER 权限 | 低权限用户执行 session SET、ALTER、写入 | 遵循权限模型；不能越权改变表级 counter。 |
 
-### 2.6 异常、性能与稳定性（7 条）
-
-| 编号 | 二级模块 | 测试场景 | 测试步骤 | 预期结果/记录项 |
-| --- | --- | --- | --- | --- |
-| AINC-054 | 错误恢复 | DDL/DML 中断 | 建表/ALTER/批量插入中注入故障并重试 | 无半成品 metadata、重复 ID 或资源泄漏。 |
-| AINC-055 | 性能 | cache大小与旧版默认对比 | 同硬件/数据/并发下比较合入前默认、合入后CACHE=0及1/8/大值；至少3轮 | 记录QPS、p50/p95/p99、分配RPC/跨度、CPU/内存及gap；旧版仅比默认策略。报告中位数、波动与相对变化，性能不能替代034正确性。 |
-| AINC-056 | 性能 | inc/off 影响 | 默认与多个 inc/off 组合的多 CN 压测 | 正确性不变，记录协调/吞吐差异。 |
-| AINC-057 | 长稳 | 单表热点 2 小时 | 多 CN 高并发自动/显式混合插入 | 无重复、CN 重启、计数器耗尽、内存增长或性能持续退化。 |
-| AINC-058 | 长稳 | 多表混合 | 不同类型/cache/session 设置的表混合写 | 配置隔离；无跨表污染。 |
-| AINC-059 | 边界 | 接近类型上限 | 多 CN 并发逼近整数上限并尝试续租 | 溢出前不重复，溢出后稳定报错且服务健康。 |
-| AINC-060 | 回归 | 非 auto DML/既有表 | 执行普通 PK、sequence（如有）、旧 auto BVT | 无功能/性能回归。 |
-
-### 2.7 发布开关与协议边界（6 条）
+### 2.6 发布开关与协议边界（6 个执行单元）
 
 本节重启用例使用独占测试集群及同一持久数据目录；停止服务后修改配置并重启，不通过修改运行中对象模拟生产配置切换。
 
@@ -192,7 +150,7 @@ enable-auto-id-cache = true
 | AINC-065 | 协议门禁 | V80/V81与开关组合 | UT分别控制本地版本、PRE_INSERT发送端/接收端版本及开关；有效非零策略做拒绝/接受对照 | 合入契约下V80拒绝、V81且开启接受；关闭仍拒绝。失败不发布metadata、不构造可静默丢策略的执行路径；不是混合版本支持证明。 |
 | AINC-066 | 发布流程 | 全角色升级与降级边界 | 排空事务、停全部旧CN/TN、升级全部角色、确认节点清单/版本后全CN开启；验证新旧表 | 同版本集群读写与策略正确；记录旧进程已停止的证据。不把旧节点重入、混合运行或含非零策略的原地降级列为支持场景；局部门禁不能证明集群准入。 |
 
-### 2.8 观察、生命周期与语法补充（7 条）
+### 2.7 观察、生命周期与语法补充（7 个执行单元）
 
 | 编号 | 二级模块 | 测试场景 | 测试步骤 | 预期结果 |
 | --- | --- | --- | --- | --- |
@@ -204,12 +162,12 @@ enable-auto-id-cache = true
 | AINC-072 | 物理导出恢复 | DUMP TABLE/LOAD TABLE | 默认session、CACHE=1源表写ID=1，flush后经stage/object执行DUMP TABLE；目标LIKE源表后LOAD TABLE，冷CN观察并写入 | 目标CACHE=1与数据1恢复，随后ID=2、总行数2；明确覆盖公开DUMP/LOAD入口、对象路径和Reset，不用逻辑导出结果代替。 |
 | AINC-073 | 语法所有权 | 表级/分区级/ALTER | ALTER AUTO_ID_CACHE；PARTITION与SUBPARTITION选项放CACHE=0/1；表级合法选项和已有分区选项作控制 | ALTER CACHE不支持；分区/子分区位置即使0也在解析边界拒绝且不留表；合法表级选项不能误拒绝。 |
 
-### 2.9 元数据性能与策略传递（2 条）
+### 2.8 观察scope与策略传递（2 个执行单元）
 
 | 编号 | 二级模块 | 测试场景 | 测试步骤 | 预期结果/记录项 |
 | --- | --- | --- | --- | --- |
-| AINC-074 | 观察成本 | 多空表及共享frontier | 多个空CACHE=1表执行SHOW/info-schema；UT覆盖同一次internal_auto_increment向量求值的并发观察、不同求值；性能比较1/100/1024表 | 同求值共享一次屏障，点查均携带该frontier且不缓存offset；不同求值取新frontier。不是整条SQL永远一次屏障；记录求值次数、屏障/点查数与端到端p50/p95，不以旧的无屏障点查基准代替当前延迟。 |
-| AINC-075 | 策略绑定 | 冷加载/Reset物理ID | UT覆盖已解析TableDef/relation策略、旧ID→替换ID、已绑定新ID、无关ID与无hint；SQL覆盖TRUNCATE/COPY/CLONE/LOAD | 已知且匹配策略复用、Reset正确重绑；无关/缺失hint回退持久发现，不能跨表借用策略。开关/版本检查仍有效；记录默认表大目录冷加载与Reset成本，不要求所有路径零目录查询。 |
+| AINC-074 | 观察scope | 共享frontier但不缓存offset | UT覆盖一次internal_auto_increment向量求值的多表/并发观察，以及第二次独立求值；记录屏障、点查和请求scope | 同求值共享一次屏障，全部点查携带该frontier且不缓存offset；不同求值获取新frontier。不是整条SQL永远一次屏障；无自动号段分配。 |
+| AINC-075 | 策略绑定 | 冷加载及Reset物理ID | UT覆盖TableDef/relation已知策略、旧→替换ID、已绑定新ID、无关ID及无hint；关联021/052/072的SQL证据 | 仅匹配策略可复用，Reset正确重绑；无关/缺失hint回退持久发现，不跨表借用；开关/版本检查仍有效，不要求每条路径零目录查询。 |
 
 ## 3. 基线与判定
 
@@ -253,7 +211,6 @@ enable-auto-id-cache = true
 
 - SQL/BVT检查用户可见结果、SHOW、错误和持久化；UT证明分配次数、跨度、事务所有者、屏障时序、协议拒绝及策略绑定。
 - 多CN集成验证冷加载、即时观察、真实DDL生命周期；独占重启集群验证关闭/开启配置及数据持久性。
-- 性能比较以同环境、相同数据/并发和至少3轮结果为依据；报告绝对值、相对变化、波动及预先约定阈值。尚未约定阈值时报告测量结果，不自行宣称性能验收通过。
 - 下列映射为已存在测试的复用入口。执行报告逐用例填写实际commit、命令、证据、结果及未覆盖项；历史PR中的“通过”不等于本轮通过。
 
 ## 4. 结果记录要求
@@ -261,23 +218,22 @@ enable-auto-id-cache = true
 - 记录精确MatrixOne commit/镜像、全角色版本/节点清单、各CN开关、协议版本、CACHE、session inc/off/effective_off、表定义、规模、并发和seed。
 - 并发记录每行writer_id/request_id、session/CN、自动/显式标记、提交结果、重试次数；提供计划/成功/失败/未知结果数、实际行数及逐请求对账，单列自动分配duplicate-key。
 - cache/故障用例记录分配区间、实际 gap、重启/故障时间、系统日志或 metrics；未观察到内部指标时须明确说明。
-- 性能至少 3 轮，记录 QPS、p50/p95、CPU/内存、counter RPC/等待（可得时）；仅同环境、同数据快照可比较。
 - 缺陷附最小建表 SQL、变量设置、并发脚本/seed、完整 ID 集合、拓扑及错误日志。
 - 观察用例记录owner事务、提交时间戳、frontier、屏障/点查/分配次数；取消与错误路径保留资源清理证据，不以sleep/retry后的成功覆盖首次失败。
 - 生命周期记录操作前后物理表ID、持久CACHE、M/H/N、数据与下一个生成值；重启记录停服/配置/启动步骤。每个参数组合独立给结果。
 
 ## 5. 已有测试复用映射
 
-以下名称已核对PR #28528的合入内容，定位入口为[PR文件变更](https://github.com/matrixorigin/matrixone/pull/28528/files)。映射表示相关覆盖，不表示单个函数覆盖整行用例全部参数；未覆盖的SQL组合、多CN压力和性能仍须补执行。
+以下名称已核对PR #28528的合入内容，定位入口为[PR文件变更](https://github.com/matrixorigin/matrixone/pull/28528/files)。映射表示相关覆盖，不表示单个函数覆盖整行用例全部参数；未覆盖的本表必要SQL组合与多CN时序仍须补证据；不追加通用压力/性能范围。
 
 | 设计用例 | 已有测试入口 | 复用证据/还需执行 |
 | --- | --- | --- |
-| 002、009、010、012 | `TestAutoIDCachePlanAndPersistence`、`TestAutoIDCacheZeroWithoutAutoColumn`、`TestAutoIDCachePlanRejectsInvalidOptions`、`TestAutoIDCacheAlterFinalDefinition` | 合法/非法选项、无auto列零策略、最终schema归一化；补多自增列SQL及起点边界。 |
-| 034、035、037 | `TestAutoIDCacheDemandOnly`、`TestAutoIDCacheExplicitSpanAndConcurrentDemand` | 复用§3.3精确请求列表；补空SQL输入、实际大batch与默认session组合。 |
+| 002、003、006、009、010、012 | `TestAutoIDCachePlanAndPersistence`、`TestAutoIDCacheZeroWithoutAutoColumn`、`TestAutoIDCachePlanRejectsInvalidOptions`、`TestAutoIDCacheAlterFinalDefinition` | 合法/非法选项、无auto列零策略、最终schema归一化；补多自增列SQL及起点边界。 |
+| 034、035 | `TestAutoIDCacheDemandOnly`、`TestAutoIDCacheExplicitSpanAndConcurrentDemand` | 复用§3.3精确请求列表；补空SQL输入、实际大batch与默认session组合。 |
 | 040、061..065 | `TestAutoIDCacheOptInConfig`、`TestAutoIDCacheDisabledHasNoAllocatorSideEffects`、`TestAutoIDCacheDDLAndProtocolGate`、`TestAutoIDCacheDDLRejectsBeforeMetadataWork`、`TestAutoIDCacheRemoteWireGate`、`TestAutoIDCacheRestartAndDisabledNode` | 开关、副作用、协议、独占重启；064维护例外和066部署流程须单独记录。 |
-| 008、044、067..070 | `TestAutoIDCacheUncommittedObservation`、`TestAutoIDCacheColdServicesAndProbe`、`TestAutoIDCachePointObservation`、`TestAutoIDCachePointObservationWaitsForBarrierBeforeRead`、`TestAutoIDCachePointObservationBarrierErrors`、`TestAutoIDCachePointObservationErrors` | 事务所有者、无预留、读前屏障及错误；配合公开SQL/多CN即时观察。 |
+| 067..070 | `TestAutoIDCacheUncommittedObservation`、`TestAutoIDCacheColdServicesAndProbe`、`TestAutoIDCachePointObservation`、`TestAutoIDCachePointObservationWaitsForBarrierBeforeRead`、`TestAutoIDCachePointObservationBarrierErrors`、`TestAutoIDCachePointObservationErrors` | 事务所有者、无预留、读前屏障及错误；配合公开SQL/多CN即时观察。 |
 | 012、021、048、052、068、069、071、072 | `TestAutoIDCachePublicLifecycle`；现有`auto_id_cache.sql`及对应`.result` | 复用普通/临时事务差异、COPY/RENAME/LIKE、TRUNCATE、SHOW、DUMP/LOAD；CLONE精确结果映射BVT，保留各路径独立验收。 |
 | 073 | `TestAutoIDCacheRejectsPartitionOwnership`、`TestAutoIDCacheASTOwnership`；公开生命周期及BVT | 分区/子分区位置拒绝与表级正向控制；补ALTER CACHE拒绝入口。 |
-| 074、075 | `TestAutoIDCacheObservationScopeConcurrent`、`TestAutoIDCacheKnownPolicyObservationSQL`、`TestAutoIDCacheResetPolicyRebinding`、`TestAutoIDCacheResetCarriesReplacementPolicy` | 共享屏障/不缓存offset、已知策略/Reset重绑和回退；大目录及带屏障端到端性能单独测量。 |
+| 074、075 | `TestAutoIDCacheObservationScopeConcurrent`、`TestAutoIDCacheKnownPolicyObservationSQL`、`TestAutoIDCacheResetPolicyRebinding`、`TestAutoIDCacheResetCarriesReplacementPolicy` | 共享屏障/不缓存offset、已知策略/Reset重绑和回退；SQL证据关联021/052/072，不追加大目录性能。 |
 
-本次文档修订完成标准：研发review六类意见均有对应预期/用例、编号与数量一致、Markdown表格正常渲染。数据库执行状态另行记录，不将文档检查标记为UT/BVT通过。
+本次必要项评审保留研发review六类要求：合法参数与M/H/N、默认关闭发布边界、确定性需求分配、不耗号及事务观察、精确生命周期、完整并发对账。重复总括项008/044分别归DDL和067..075，不能漏掉其底层断言。数据库执行状态另行记录，不将文档检查标记为UT/BVT通过。
