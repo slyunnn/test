@@ -1,10 +1,10 @@
-# MatrixOne 多索引过滤向量检索测试设计（必要验证精简版）
+# MatrixOne 多索引过滤向量检索测试设计（必要项二次评审版）
 
 > Feature [#28988](https://github.com/matrixorigin/matrixone/issues/28988)：HNSW、IVF-FLAT、CAGRA、IVFPQ 的过滤向量检索。
 >
-> 修订日期：2026-10-27。实现基线为已合入 [PR #30127](https://github.com/matrixorigin/matrixone/pull/30127)，merge commit `60ad9a14fc6eda33b10ce74226078de3cffd24b2`。
+> 修订日期：2026-10-28。实现基线为已合入 [PR #30127](https://github.com/matrixorigin/matrixone/pull/30127)，merge commit `60ad9a14fc6eda33b10ce74226078de3cffd24b2`。
 >
-> 本版以“必要测试”为准则：保留需求验收、高危实现路径和已知回归；移出性能基准、收益评估及长稳专项。原设计的 70 个编号被裁剪为 **52 个保留编号**，并通过共用数据与同次执行的断言组织为约 **40 个有效执行单元**。本文件是测试设计，不代表已执行结果。
+> 本轮将上版表内52个执行行（涉及62个原编号）精简为 **38个执行单元**。每行使用单一主编号，合并项成为必须断言；修正上版参数章节的编号/语义错位，保留模式、算法特有终止、C/GPU资源和协议门槛。本文件是测试设计，不代表已执行结果。
 
 ## 1. 验收范围与裁剪原则
 
@@ -66,130 +66,128 @@ GPU 结论必须来自真 GPU 与匹配 libmo/cuVS 构建；CPU 回退或 force 
 4. **迭代证据**：最终满 K 不是扩搜的证据。HNSW/CAGRA/IVFPQ 记录轮次 knob；IVF-FLAT 记录不重复 list cursor；auto 记录实际分支。
 5. **排序与分页**：精确控制在过滤、合并后应用 offset/limit；同距离按距离组判断，不能通过添加第二排序键改变被测语义。
 
+### 2.3 本轮统计
+
+| 模块 | 执行单元 |
+| --- | ---: |
+| 模式与策略 | 5 |
+| 过滤、数量与距离 | 6 |
+| 扩搜、终止与分页 | 8 |
+| 参数、PREPARE与协议 | 5 |
+| C membership/GPU mask | 6 |
+| 生命周期与分支 | 8 |
+| **合计** | **38** |
+
 ## 3. 必要执行项
 
-下表中的编号沿用原设计，便于关联现有 BVT/UT/C++ 测试。若同一行列出多个编号，表示它们在同一 fixture 或执行单元内完成，而不是分别新增一套数据。
+每行一个主编号/执行单元，复用同一fixture完成相邻控制和合并断言；不再为模式别名、零值、session隔离等重复装载数据。保留各算法独立终止和直接C/GPU路径。
 
-### 3.1 模式与策略（8 项）
+### 3.1 模式与策略（5项）
 
-| 保留编号 | 场景与必要断言 |
+| 编号 | 场景与必要断言 |
 | --- | --- |
-| FVS-001 | 四算法未设 mode 的兼容行为；INCLUDE 与非 INCLUDE 分组，记录短页而不把 default 当 auto。 |
-| FVS-002 | `post` 的 PK、INCLUDE、普通列过滤；确认单次搜索与无过滤泄漏。 |
-| FVS-003 + FVS-009 | `pre` 的 INCLUDE/非 INCLUDE 过滤和实际服务索引能力；距离不匹配或实际使用的不支持组合被正确拒绝，未选索引不误拒绝。 |
-| FVS-004 + FVS-005 | `iterative` 的近端不合格 fixture；确认扩搜、终止及 `include=iterative` 别名等价。 |
-| FVS-006 | `auto` 的 post 满页、post 短/pre 满页、前两支短三种分支；不要求满页 ANN 必然等于 force 的 ID。 |
-| FVS-007 | `force` 在 CPU/GPU 环境均走精确 CPU oracle，而非索引/GPU 搜索。 |
-| FVS-008 | 多输出、聚合包裹、特殊 membership/volatile 等不安全区域安全 force 或省略不必要分支；保持 SQL 语义。 |
-| FVS-010 | IVF-FLAT 的 post + INCLUDE 例外：空页、非空短页、满页；不得把空页 force 兜底外推为所有短页补齐。 |
+| FVS-001 | 四算法default/post及force控制：省略mode不等于auto；post只搜一次，PK/INCLUDE过滤位置按矩阵，force精确CPU oracle。合并002/007，不另跑全套相同数据。 |
+| FVS-003 | pre的INCLUDE/非INCLUDE过滤；仅真正服务查询的索引校验能力，未服务索引不误拒绝。吸收009，不扩全部多索引排列。 |
+| FVS-004 | iterative的资格内过滤、扩搜与停止；include作为iterative别名在同fixture对照，不误作独立策略。 |
+| FVS-006 | auto三种必要分支（post满、post短/pre满、前两支短）；另用多输出/外层聚合代表性安全force控制。无用pre支可省略；volatile复用060，不为每种SQL包裹单建矩阵。 |
+| FVS-010 | IVF-FLAT post+INCLUDE的空页force兜底、非空短页、满页控制；不能把空页行为推广成全部短页自动补齐。 |
 
-### 3.2 过滤、数量与距离（10 项）
+### 3.2 过滤、数量与距离（6项）
 
-| 保留编号 | 场景与必要断言 |
+| 编号 | 场景与必要断言 |
 | --- | --- |
-| FVS-011 | 原 Issue 红例在两 CN：HNSW category=1；比较 default/post/pre/iterative/auto/force，保留历史 0/10 与精确 10/10 的动机控制。 |
-| FVS-012 | L2 覆盖全部适用算法；cosine、IP 各保留一个 HNSW 单调回归。能力不支持时记录矩阵，不用错误 op_type 伪造覆盖。 |
-| FVS-013 | PK 范围、IN、负数/稀疏 BIGINT；防止映射或小 membership 丢行/泄漏。 |
-| FVS-014 | 同值列一列进入 INCLUDE、一列不进入 INCLUDE；证明索引内过滤与 membership/residual 的真实差异。 |
-| FVS-015 + FVS-022 | 混合 PK/INCLUDE/普通列的 AND/OR/NULL 与 IN/SEMI 资格；每个结果满足完整 WHERE，保留原 SQL multiplicity。 |
-| FVS-016 | 周期选择率和近端不合格数据；在同一执行单元保留历史预算边界 `K=9/10` 与 `K=49/50`，检查不再出现固定倍数阈值短页。 |
-| FVS-017 | NULL 谓词、NULL 向量/参数/键；遵循 SQL 三值逻辑与索引可见性。 |
-| FVS-018 | 一组距离范围边界（含/不含边界）；距离谓词不可被误建为普通 PRE 域。 |
-| FVS-019 | Q=0、Q=3、空表/空域；不为凑 K 无限取数，缺 required 域是失败而非空集。 |
-| FVS-020 + FVS-034 | Q=K 与 Q≫K；符合契约时完成路径返回 P，并断言“满页”不被误判为精确召回。 |
+| FVS-011 | 原近端全不合格红例与id%7周期分布，双CN抽测；同fixture保留K9/10、49/50历史边界。pre/iterative按能力和cap验收，default/post短页仍单列需求差异，不能统一要求“不再短页”。 |
+| FVS-012 | L2覆盖全部适用算法，cosine/IP各一个HNSW单调控制；能力不支持明确记矩阵，不用错误op_type伪造覆盖。 |
+| FVS-014 | 同值列一个进INCLUDE、一个不进；证明索引内过滤与membership/residual区别。INCLUDE机制必须建含列索引，不能只写mode=include。 |
+| FVS-015 | 同fixture保留PK范围/IN、组合AND/OR、NULL谓词及IN/SEMI；负/稀疏key编码复用045直接UT。现有hybrid-fulltext BVT必跑，filter-only MATCH在producer单次执行；不扩完整谓词排列或任意INNER JOIN能力。 |
+| FVS-018 | 一组距离范围含/不含边界，source条件不丢；距离谓词不被误建为普通PRE域，PQ/量化排名与原WHERE合法性分开。 |
+| FVS-019 | Q=0、少于K、恰好K、多于K及空表/空域，共用数据控制；P计算正确，空域不当PASS，不能无限凑K。满页与精确召回是两件事，吸收020/034；NULL/未索引成员数不混成可搜索Q。 |
 
-现有 hybrid-fulltext BVT 不再新设 FVS-021 执行项，但必须作为本 PR 已改变 PRE/membership 路径的**复用回归证据**；其结果记录在覆盖映射中。
+### 3.3 扩搜、终止与分页（8项）
 
-### 3.3 扩搜、终止和分页（10 项）
-
-| 保留编号 | 场景与必要断言 |
+| 编号 | 场景与必要断言 |
 | --- | --- |
-| FVS-023 | HNSW 多子索引；确认实际子索引数、跨子索引全局合并、PK 去重和只读 membership 共享。 |
-| FVS-024 + FVS-033 | HNSW 小/大 itopk、max_itopk 和 membership 预测起点；每轮推进、有界停止、无进展/重复候选不得循环，且不污染共享 ef_search。 |
-| FVS-025 | CAGRA 超过 1024 行和合格数不足 K；不向 cuVS 发超上限 key 预算，合法短页在 cap 停止。 |
-| FVS-026 + FVS-033 | IVFPQ 以实际 built NLists 而非 catalog 值上限；nprobe 饱和、索引行数、cap 和无进展均终止。 |
-| FVS-027 | IVFPQ overflow-only 首轮即耗尽；inline index 缺 lists 与 CREATE INDEX 一致拒绝。 |
-| FVS-028 + FVS-033 | IVF-FLAT 连续 centroid cursor；列表不重扫、无重复 PK、最终访问序列正确。 |
-| FVS-029 | IVF-FLAT 小精确 membership 只保留 100/101 边界；前者全 list 精确路径，后者不误套小域保证。 |
-| FVS-030 | 多 reader/分区拆分下的完成边界；按交付契约记录单轮短页，不能宣称无条件完成。 |
-| FVS-031 | 分页仅保留 10/10 与 10/500；精确控制符合切片，ANN 预算变化不被误当分页拼接缺陷。 |
-| FVS-032 | offset、limit=0 和页目标已达；limit=0 不发起无效搜索，提前满足即停止。 |
+| FVS-023 | HNSW多子索引上小/大itopk及cap，确认全局合并/去重、预测起点、逐轮推进和有界结束；不污染共享ef_search。合并024及该算法033无进展断言。 |
+| FVS-025 | CAGRA表>1024行且合格<K；itopk/max_itopk SQL1024接受、1025拒绝，session超限截到1024；无历史cuVS越界和无界扩搜，恢复原038的CAGRA语义到此主项。 |
+| FVS-026 | IVFPQ以实际built NLists为上限，probe扩大/饱和、cap和行数终止；加入033无进展/重复候选控制，不只看catalog lists。 |
+| FVS-027 | IVFPQ overflow-only首轮搜索完即终止；inline无lists与CREATE INDEX同样拒绝，不能建成后无限迭代。 |
+| FVS-028 | IVF-FLAT cursor推进、list不重扫、零向量/同分质心完整permutation；合并033重复/无进展控制。 |
+| FVS-029 | IVF-FLAT exact membership 100/101边界，纯INCLUDE同样少量匹配作控制；不能误套小精确域全list保证。 |
+| FVS-030 | local DOP/多reader拆分形态；保留真实physical plan，按交付单轮/短页边界记录，不假设单reader结果证明分布式补满。 |
+| FVS-031 | K/O=10/10与10/500，追加K0及提前满页控制；offset仅对过滤合并结果生效，零页不发无效搜索、不挂起。算法预算溢出通过现有UT断言覆盖，不另建大OFFSET压力数据。 |
 
-### 3.4 参数、PREPARE 与协议（8 项）
+### 3.4 参数、PREPARE与协议（5项）
 
-| 保留编号 | 场景与必要断言 |
+参数编号恢复原设计含义：039/040对应执行期session/优先级，原037的范围校验并入035，原038的CAGRA上限并入025。
+
+| 编号 | 场景与必要断言 |
 | --- | --- |
-| FVS-035 | 四种 SQL knob 的合法/非法解析、适用算法和边界错误。 |
-| FVS-036 | 搜索 knob 对请求的生效值，SQL option 与算法能力相符。 |
-| FVS-037 | `PREPARE` 后改变 session knob；每次执行解析，literal 与 prepared 语义一致。 |
-| FVS-038 | 并发会话设置隔离，不把 session 值写回共享计划或另一会话。 |
-| FVS-039 + FVS-040 | SQL、session、默认值的优先级及 session 内组合；仅在一项执行中验证优先级和隔离。 |
-| FVS-041 | 最大 uint64 itopk；HNSW/IVFPQ/IVF-FLAT 有实际行数限制且不 panic，CAGRA 依上限拒绝。 |
-| FVS-042 | EXPLAIN 显示 SQL knob 和 Index Filter；运行期 session 值以 request/UT 佐证，不能只从 EXPLAIN 推断。 |
-| FVS-043 + FVS-044 | 有 knob 时对 prior protocol 版本在 placement、发送重探、handshake/receiver 拒绝；无 knob 控制仍按基础协议运行，非向量 scan 不抬高要求。 |
+| FVS-035 | 四SQL knob的解析/适用族，unknown key、非正整数、cap<start、nprobe1/80000/80001；graph不接受IVF probe knob，实际适用族中mode不生效的合法选项可接受。合并036/037。 |
+| FVS-039 | PREPARE后SET三个vector_*、执行、reset；SQL>session>index/default优先级及两个session隔离一并验证。probe_limit保持原计划期行为，不错当三个执行期变量；不写回共享plan。 |
+| FVS-041 | 最大uint64 itopk的实际行数/分配边界与storage Top-K列，HNSW/IVFPQ/IVF-FLAT不panic，CAGRA按1024上限拒绝。 |
+| FVS-042 | EXPLAIN显示SQL参数/Index Filter，session有效值用request/UT佐证；实际轮次、分支和终止不能从静态EXPLAIN臆断。 |
+| FVS-043 | 合入基线V127新增knob scope在placement、发送re-probe、handshake/decode拒绝prior版本；无knob按V111基础协议控制。远端副本只stamp适用参数，非向量扫描不抬版本；不能据此推断旧节点会正确执行无knob的iterative。 |
 
-### 3.5 C membership 与 GPU mask（7 项，GPU 门槛）
+### 3.5 C membership与GPU mask（6项）
 
-| 保留编号 | 场景与必要断言 |
+| 编号 | 场景与必要断言 |
 | --- | --- |
-| FVS-045 | 紧凑、稀疏、跨 container、负/远距 BIGINT；cbitmap/CRoaring/sorted64 的选择、键编码和非法元素宽度。 |
-| FVS-046 | GPU 收到 Go-memory 或非 exact membership 时明确拒绝；空 exact 集合表示拒绝全部，不能按无过滤继续。 |
-| FVS-047 + FVS-052 | membership 和 mask/delete copy 的内存准入、失败传播、引用共享与最后释放；不部分执行或静默 CPU 替代。 |
-| FVS-048 + FVS-051 | membership、INCLUDE/PK、删除位的 AND mask；prepare 时已有删除必须排除，分片/负稀疏 PK 正确。 |
-| FVS-049 | CAGRA/IVFPQ 多轮与 multi-index/shard 每个对象只准备一次 mask 并复用；释放正确。 |
-| FVS-050 | prepare 后新增行不因 mask 末尾默认全 1 通过；上传清尾位并限制 shard copy。 |
-| FVS-053 | IVFPQ 探测列表无合格项的 sentinel；不泄漏非法 ID/距离，空首轮不等于全索引耗尽。 |
+| FVS-045 | cbitmap/CRoaring/C sorted64表示选择、负/稀疏key编码、非法元素宽度；GPU拒绝Go-owned/non-exact或缺host_ids，空exact表示拒绝全部。合并046直接错误控制。 |
+| FVS-047 | membership与mask/delete copy准入门槛/拒绝、共享引用及最后Free；失败不部分执行或静默换CPU，合并052内存断言。 |
+| FVS-048 | membership AND INCLUDE/PK AND删除位，shard切片正确；prepare前删除排除，轮间删除按已声明快照契约，吸收051。 |
+| FVS-049 | CAGRA/IVFPQ每index/shard/overflow准备一次bitset、多轮复用；prepare/host pass/upload次数与释放有直接证据。 |
+| FVS-050 | prepare后追加行不能因mask尾部默认全1通过；清尾位及copy限制shard范围，复用直接C++/GPU测试。 |
+| FVS-053 | IVFPQ所探list无合格项的padding/sentinel正确剔除，非法ID/距离不泄漏，不出现vector magnitude错误；首轮空不是全索引耗尽。 |
 
-锁持有细节不单设 FVS-054；其代码核对结果附于 GPU 执行记录，取消与错误传播由 FVS-058 验证。
+### 3.6 生命周期与分支（8项）
 
-### 3.6 DML、生命周期与多 CN（9 项）
-
-| 保留编号 | 场景与必要断言 |
+| 编号 | 场景与必要断言 |
 | --- | --- |
-| FVS-055 | INSERT/DELETE/UPDATE 向量、普通列和 INCLUDE 列在既有可见性屏障后重算资格；rollback 行不可见。 |
-| FVS-056 | CAGRA/IVFPQ built index + CDC overflow；membership、PK、子查询过滤均全局合并且无重复/遗漏。 |
-| FVS-057 | async REINDEX 空 pipeline 与 sharding；无 rows 不 panic，generation、host_ids/mask 一致。 |
-| FVS-058 + FVS-059 | 跨轮取消、设备/构建/缺 required 域失败和空域；及时停止、无下一轮、资源归还，缺域不当作空集。 |
-| FVS-060 | volatile/sequence 过滤或 membership join；危险重放走 exact，表达式按语义单次求值。 |
-| FVS-061 | 一条 producer/回表并发更新的语句快照控制；不新增完整权限矩阵。 |
-| FVS-062 | CN1/CN2 抽测：红例、周期选择率、prepared/cap；确定性 fixture 一致，ANN 以合法性/行数/recall 判定。 |
-| FVS-063 | 仅保留 UNION ALL 多分支向量搜索；runtime filter、knob 与状态按分支隔离，合法重复保留。 |
-| FVS-064 | prepared 后 drop/rebuild 索引；不得复用失效 generation/domain/mask，需重规划或明确失效。服务冷启动/重启移至稳定性专项。 |
+| FVS-055 | INSERT/DELETE/UPDATE普通/INCLUDE/向量列及一条rollback，在既有同步屏障后资格/存活性正确；不重复全部事务排列。 |
+| FVS-056 | CAGRA/IVFPQ built+CDC overflow，PK/subquery/membership按交集过滤后全局合并，无重复/遗漏。 |
+| FVS-057 | async REINDEX空pipeline与shard切换，无rows不panic，generation/host_ids/mask一致。 |
+| FVS-058 | 缺required域、构建/设备失败、空域及跨轮取消，各路径复用生命周期fixture；停止及时、错误不伪空成功、资源归还，后续请求正常。合并059，锁持有仅附代码核对，不另建054项。 |
+| FVS-060 | sequence/volatile filter及membership join危险重放走安全exact，按语义单次求值；filter-only MATCH复用015证据。 |
+| FVS-061 | 一条producer/回表并发更新的语句快照控制；保留同快照，不新增权限矩阵。 |
+| FVS-063 | UNION ALL双分支向量搜索，runtime filter/knob/state各自独立，合法重复不被去重。 |
+| FVS-064 | prepare后一次drop/rebuild依赖控制，重规划或明确失效，不复用旧generation/domain/mask。服务重启、全量冷启动不在必要项。 |
 
 ## 4. 执行批次与门槛
 
-### 第 1 批：CPU 功能验收（P0）
+1. **CPU批次**：第3节所有适用HNSW/IVF-FLAT模式、过滤、参数、两种迭代终止与protocol/C资源UT；双CN红例及PREPARE/session抽测并入011/039/043，不另设062全矩阵。030 split-reader边界不得漏执行。
+2. **GPU批次**：第3节所有适用CAGRA/IVFPQ模式和参数、各自终止、prepared mask、built+overflow、shard及取消；GPU在交付范围内即为功能门槛，没有硬件记阻塞，CPU/force不能替代。
+3. **复用证据**：hybrid-fulltext、snapshot/volatile、UNION ALL及索引依赖回归按015/060/061/063/064记录，不因合并而变成可选项。
 
-依次执行 FVS-011；FVS-001/002/003+009/004+005/006/007/008；FVS-013..020；FVS-023/024/028/029/031/032；FVS-035..043；FVS-062 抽测。
+不安排性能冒烟、ANN benchmark、跨产品比较、长稳或服务重启。轮次与内存只作为功能执行证据记录，不扩成收益测量。
 
-此批用 SQL 和现有 CPU UT 回放，覆盖 Issue 的模式、短页、可观测、prepared、数量分档和双 CN 五类验收。FVS-021 的现有 hybrid-fulltext BVT 作为必跑复用证据附入本批结果。
+## 5. 裁剪及可复用证据
 
-### 第 2 批：GPU 功能验收（P0，适用于 GPU 交付）
+### 5.1 编号处置
 
-执行 FVS-025/026/027；FVS-045..050/053；FVS-010；FVS-055..058/060/061/063/064。
+保留38个主编号，不再把“涉及的原编号数”“表格行数”和“约执行次数”混算。合并关系：
+002/007→001；005→004；008→006；009→003；013/017/021/022→015；016/062→011（prepared双入口另附039）；020/034→019；024→023；032→031；033→023/026/028；036/037→035；038→025；040→039；044→043；046→045；051→048；052→047；059→058/019。
 
-CAGRA/IVFPQ 若在发布范围内，本批为功能门槛；没有合格 GPU 环境只能报告阻塞，不能以 CPU 或 force 代替。
+原054锁细节仍只做代码核对；065..070及服务重启/权限扩展不列必要执行项。保留原需求与交付差异的验收义务。
 
-### 第 3 批：非门槛专项（按需或 nightly）
+### 5.2 直接复用入口
 
-- 性能冒烟：一个固定数据集、七种 mode、100% 与 5% 两个选择率点，记录延迟、返回数和 recall；无预设性能阈值时只报告事实。
-- GPU mask 收益、ANN benchmark、跨产品比较：移入独立 benchmark 计划。
-- 两小时混合长稳、冷启动/服务重启：移入 nightly/stability 计划。
-- FVS-068 的轮次、累计工作量、内存峰值作为 FVS-024/026/028 的记录项，不单设执行项。
+路径相对MatrixOne，CPU位于`test/distributed/cases/`，GPU位于`test/distributed/gpu_cases/`。
 
-## 5. 编号处置映射
-
-| 处置 | 编号 |
+| 保留项 | 入口/证据 |
 | --- | --- |
-| 保留为主项或合并主项 | 001-020（除 021）、022-032、035-043、045-050、053、055-058、060-064 |
-| 合并为父用例断言 | 005→004，009→003，022→015，033→024/026/028，034→020，040→039，044→043，051→048，052→047，059→019/058 |
-| 复用既有回归、不新设执行项 | 021 hybrid fulltext BVT |
-| 移出本 Feature 合入门槛 | 065/066 压缩为性能冒烟；067、069 移 benchmark；070 移 nightly；064 的冷启动/重启部分移 stability |
-| 删除的冗余变体 | 061 的权限矩阵；063 的多索引/JOIN 变体（保留 UNION ALL） |
+| 001/003/004/006/010/011/012/014/015/018/019 | CPU `vector/vector_filtered_search_{hnsw,ivfflat,modes}.sql`，GPU `vector/vector_filtered_search_gpu.sql`及相应result；花括号表示三个实际文件，不是单一文件名。 |
+| 015/060 | CPU/GPU `vector/vector_hybrid_fulltext*.sql`；`TestVectorPreFulltextMembershipSearchesOnce`、`TestVectorPreVolatileFilterRunsOnce`。 |
+| 023/025/026/027/028/029/030/031 | 四算法iterative UT；IVFPQ `TestIterativeSearchTerminates`；`TestCompleteCentroidRanking`；`vector_cagra_itopk_limit.sql`及`vector_ivfpq_iterative_overflow.sql`。多reader物理形态另留SQL证据。 |
+| 035/039/041/042/043 | CPU/GPU `vector_filtered_search_knobs*.sql`；`TestParseRankOptionSearchKnobs`、`TestApplySearchKnobs`、`TestStampSessionKnobs`、`TestSearchKnobScopeRefusesPriorEpochDestination`；scope协议基线按实现SHA冻结。 |
+| 045/047/048 | `TestNewForCPicksByEstimate`、`TestNewForCAdmissionDenied`、`TestFilteredSearchMembershipRejectsGoSorted64`、`TestAdmitFilterMask`；C++ `EvalFilterMembershipTest`及`FilteredSearchAppliesMembership`。 |
+| 049/050/053 | `TestGpuCagraPreparedBitset`、`TestGpuIvfPqPreparedBitset`及multi GPU对应测试；C++ `PreparedBitsetExcludesRowsAddedAfterPrepare`、`FilterEmptyInProbedListsPadsWithSentinels`。 |
+| 055/056/057/058/061/063/064 | GPU overflow/sharded BVT、`TestCreateEndWithoutRows`及现有generation/cancellation/依赖回归；缺新路径直接snapshot或取消覆盖时补场景或报缺口，不以历史通过替代。 |
+
+每行映射只作入口，实际报告记录准确文件/测试名和触发路径；相同名字在不同算法包须区分。不能只运行一个算法就填满其它算法状态。
 
 ## 6. 证据与结果出口
 
-每个执行单元记录：MatrixOne SHA、运行环境与 GPU/原生库版本、数据与索引实况、完整 SQL/参数、Q/P/actual、过滤/重复检查、有效请求 knob、EXPLAIN 与实际执行证据、轮次/分支/终止原因、错误和资源清理。
+38个执行单元逐项记录：MatrixOne SHA、运行环境与 GPU/原生库版本、数据与索引实况、完整 SQL/参数、Q/P/actual、过滤/重复检查、有效请求 knob、EXPLAIN 与实际执行证据、轮次/分支/终止原因、错误和资源清理。
 
 验收输出必须分两层：
 
