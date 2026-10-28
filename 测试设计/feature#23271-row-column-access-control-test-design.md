@@ -1,8 +1,8 @@
 # MatrixOne 行列访问控制测试设计（必要项评审版）
 
-> 本设计覆盖 Feature [#23271](https://github.com/matrixorigin/matrixone/issues/23271)：内核按角色保存并加载查询改写规则。当前交付入口为 `ALTER ROLE ... ADD/DROP RULE`，元数据为 `mo_catalog.mo_role_rule(role_id, rule_name, rule)`，其中 `rule_name` 为 `db.table` 名称。执行时必须锁定实际 MatrixOne `main` SHA；本文把 2026-09-20 的 Feature review 作为当前 Oracle 来源，不把旧 BVT `.result` 当作多角色语义的唯一依据。
+> 本设计覆盖 Feature [#23271](https://github.com/matrixorigin/matrixone/issues/23271)：内核按角色保存并加载查询改写规则。当前交付入口为 `ALTER ROLE ... ADD/DROP RULE`，元数据为 `mo_catalog.mo_role_rule(role_id, rule_name, rule)`，其中 `rule_name` 为 `db.table` 名称。执行时必须锁定实际 MatrixOne `main` SHA；以 2026-09-20 Feature review 及其后 [#29081 对单活跃角色的明确结论](https://github.com/matrixorigin/matrixone/issues/29081#issuecomment-6137880196)作为当前 Oracle 来源。
 
-> 2026-10-28 必要项评审：原 60 条精简为 33 个执行单元；保留原编号以追溯 review，编号间隙不表示漏测。合并项的不同安全入口仍须分别给出结果，不把一条通过泛化到全部入口。保留安全目标与已交付行为的差距，不将已知限制当通过。
+> 2026-10-28 必要项评审：原 60 条先精简为 33 个执行单元；随后依据 #29081 移出 5 个依赖多活跃角色合并的验收单元，当前为 28 个。保留原编号与历史证据以追溯 review，编号间隙不表示漏测。合并项的不同安全入口仍须分别给出结果，不把一条通过泛化到全部入口。保留安全目标与已交付行为的差距，不将已知限制当通过。
 
 ## 1. 测试原则
 
@@ -11,7 +11,7 @@
 | RBAC 与 rule 分离 | rule 是查询改写，不替代对象权限。无 SELECT 一律拒绝；有 SELECT 但没有 rule 时保留原 SQL/RBAC 行为；rule 解析、加载或改写失败必须 fail closed。 |
 | 原 SQL 语义保留 | 在授权可见范围内，行列权限改写不得改变 JOIN、聚合、排序、LIMIT、子查询等 SQL 原有语义。 |
 | 策略不可绕过 | 本期验收范围内的直接表扫描、view、CTE、子查询、JOIN、UNION 与 prepared plan 均须应用策略。函数、导出和 DML 见其独立的支持边界，不得把未覆盖入口写成已受保护。 |
-| 多角色规则 | 仅完全兼容的 SELECT 形态、投影表达式列表及来源才合并。兼容时在基础行过滤层以 OR 扩大可见范围；同一基础行最多一次，不同基础行的相同投影不额外去重。当前不兼容规则采用后加载的有效规则覆盖，测试必须记录加载顺序；不得擅自把它写成“拒绝冲突”或“列集并集”。 |
+| 角色生效 | 当前只保持单活跃角色；`SET SECONDARY ROLE ALL/NONE` 是成功但不改变状态的兼容操作，不自动合并单独授予的角色。显式 `SET ROLE` 和已交付的角色继承行为仍需验证。 |
 | 最小暴露 | 列权限必须阻断投影、谓词、排序、分组、表达式、通配符和元数据等可推断敏感列的路径。具体允许的谓词/错误策略须冻结。 |
 | 元数据与缓存一致 | ADD/DROP 当前只清理执行管理语句的 session rule cache；其他已热缓存 session 需以 `SET ROLE` 或重连刷新。多 CN 全局立即失效尚非已交付承诺，必须单列风险而不能按“已通过”验收。 |
 | 证据可追溯 | 保存 SQL、user/role/object、规则及错误证据，避免敏感值；不把尚未交付的审计字段或 policy version 当本期功能门禁。 |
@@ -24,7 +24,7 @@
 | hint/rule 语法 | 区分 SELECT-like 语法校验、非法/多语句注入、合法 SELECT/子查询、合法语法但对象或列绑定失败；后者必须明确记录是在创建时还是访问时失败。 |
 | 行策略语义 | 规则是查询改写 predicate；无 rule 时保留原 SQL。本期 rule 不声明 DML 行策略，写操作回归普通 RBAC，不能作为 row/column rule 通过证据。 |
 | 列策略语义 | 允许列列表/掩码/拒绝方式；对 `SELECT *`、WHERE、ORDER BY、GROUP BY、表达式与 metadata 的行为。 |
-| 多角色 | 完全相同的投影表达式列表和来源才兼容；`SET ROLE`、`SET SECONDARY ROLE ALL/NONE` 的生效集、兼容规则 OR、不同基础行重复投影保留，以及不兼容时覆盖的加载顺序。 |
+| 角色 | `SET ROLE` 显式切换活跃角色；`SET SECONDARY ROLE ALL/NONE` 不改变当前活跃角色和结果，分别授予的角色不因此自动合并。继承行为以直接验证的目标版本为准。 |
 | 生命周期 | 当前 session ADD/DROP、已热缓存 session 的 `SET ROLE`/重连、prepared 再执行的生效点；多 CN/重启/恢复需标明专项环境和未交付限制。 |
 
 ### 1.2 基本信息
@@ -35,7 +35,7 @@
 | 元数据 | `mo_catalog.mo_role_rule(role_id, rule_name, rule)`；按 `db.table` 名称标识，DDL rename/drop 与旧名复用是直接风险面。 |
 | 管理对象 | role、user、account、database/table、rule 与 session rule cache；对象 SELECT/CONNECT 授权必须在每个 case 明示。 |
 | 启用前置 | 所有角色规则 E2E 均显式执行 `SET enable_remap_hint = 1`；记录 primary role、secondary role 状态和 session/inline remap。 |
-| 多角色规则 | 相同来源及投影表达式列表时，行 predicate 在基础行层 OR；不同基础行相同投影保留。不可合并时当前实现按后加载有效规则覆盖，且不可假定不同角色顺序等价。 |
+| 角色生效 | 显式切换后以真实活跃角色及其已交付继承行为为基线；不把 secondary role OR 合并当作当前交付能力。 |
 | 主要风险 | 越权数据泄露、策略绕过、规则 SQL 注入、plan/cache 陈旧、角色组合漏判、行重复/漏行、DML 不一致。 |
 
 ### 1.3 执行范围与分层
@@ -45,13 +45,13 @@
 | 策略管理与元数据 | 9 | SQL/BVT；两个 account 的同名对象隔离必须直接验证 |
 | 单角色行列控制 | 7 | 小数据与管理员安全 Oracle 对照 |
 | SQL 改写与绕过防护 | 8 | 每个真实扫描/间接读取入口独立断言 |
-| 多角色合并 | 6 | 最小重复投影 fixture，记录活动角色及加载顺序 |
+| 角色生效与继承 | 1 | 显式切换、ALL/NONE 兼容 no-op 和继承对照 |
 | 缓存、错误与对象生命周期 | 3 | 确定时序、多 CN；加载错误优先复用 UT |
-| **合计** | **33** | 不全量重复单/多角色、单/多 CN 组合 |
+| **合计** | **28** | 不全量重复角色及单/多 CN 组合；不同安全入口仍分别取证 |
 
 ### 1.4 精简说明
 
-合并001/003/009、012/013/014/024、019/021、026/027、037/039、043/045及022/044/046/047/048；015承接035的元数据边界，011承接049的完整规则交错断言。023/034/050的通用写事务不属本期SELECT规则能力，只保留范围声明：业务DML遵循普通RBAC，不宣称行列写控制。保留032的可达间接读取风险于033。
+合并001/003/009、012/013/014/024、019/021、026/027、043/045及022/044/046/047/048；015承接035的元数据边界，011承接049的完整规则交错断言。原037/038/040/041/042依赖的多活跃角色合并不在当前交付范围；原039已并入037，同样移出当前验收，历史编号与已执行证据保留。023/034/050的通用写事务不属本期SELECT规则能力，只保留范围声明：业务DML遵循普通RBAC，不宣称行列写控制。保留032的可达间接读取风险于033。
 
 删除独立重启、备份/PITR/CDC、审计能力、性能/长稳、全量既有RBAC重复回归；无规则与对象权限回归已由004覆盖。这些不是本Feature已通过能力，也不在本文留作隐藏的必跑附录。
 
@@ -60,12 +60,12 @@
 | 资料 | 地址 |
 | --- | --- |
 | Feature | <https://github.com/matrixorigin/matrixone/issues/23271> |
-| 多角色合并约定 | <https://github.com/matrixorigin/matrixone/issues/23271#issuecomment-4447258547> |
+| 当前角色生效契约 | <https://github.com/matrixorigin/matrixone/issues/29081#issuecomment-6137880196> |
 | 现有权限回归 | MatrixOne 用户/角色、对象权限、审计、视图、备份恢复和多 CN 测试。 |
 
 ## 2. 测试用例
 
-通用模型：`sales(order_id bigint primary key, tenant_id int, region varchar(20), owner varchar(30), amount decimal(12,2), cost decimal(12,2), note varchar(200))`。每个 SQL case 必须写明 `CONNECT`、`SELECT`、默认/primary role、secondary role、`enable_remap_hint` 以及清理语句。多角色最小专用表为 `t(a int, marker int)`，seed 为 `(1,1),(1,2),(2,3)`；它避免 `order_id` 唯一而掩盖“基础行重复投影”语义。所有 case 另保留管理员手工 SQL Oracle。
+通用模型：`sales(order_id bigint primary key, tenant_id int, region varchar(20), owner varchar(30), amount decimal(12,2), cost decimal(12,2), note varchar(200))`。每个 SQL case 必须写明 `CONNECT`、`SELECT`、当前活跃角色、`enable_remap_hint` 以及清理语句；验证 secondary role 兼容行为时记录 ALL/NONE 前后角色与结果。所有 case 另保留管理员手工 SQL Oracle。
 
 ### 2.1 策略管理与元数据（9 个执行单元）
 
@@ -90,7 +90,7 @@
 | RCAC-016 | 列控制 | SELECT * | 同角色执行 `SELECT *`、`table.*` | 仅暴露允许列且列顺序/metadata 符合契约；不得包含敏感列。 |
 | RCAC-017 | 列控制 | 表达式/别名 | 使用 `cost+amount`、CASE、函数、JSON/字符串函数引用禁止列 | 不得通过表达式、别名或隐式 cast 推断禁止列。 |
 | RCAC-018 | 列控制 | WHERE/HAVING/ORDER/GROUP | 在各子句引用禁止列 | 依冻结规则拒绝或安全处理；不得以错误信息/结果泄露值。 |
-| RCAC-019 | 聚合/DISTINCT | 授权行上聚合及去重 | 可见行执行 COUNT/SUM/MIN/MAX、DISTINCT；另尝试聚合禁止列 | 聚合/去重只针对已授权输入；隐藏行不进入结果，禁止列不经聚合泄露。多角色重复值由037/042作确定性判定。 |
+| RCAC-019 | 聚合/DISTINCT | 授权行上聚合及去重 | 可见行执行 COUNT/SUM/MIN/MAX、DISTINCT；另尝试聚合禁止列 | 聚合/去重只针对已授权输入；隐藏行不进入结果，禁止列不经聚合泄露。对授权行中的重复投影保留原 SQL 的普通投影与 DISTINCT 语义。 |
 | RCAC-020 | 分页 | LIMIT/OFFSET/ORDER | 策略行过滤后排序分页 | 先授权过滤再排序/分页，不能用 offset 绕过或推断隐藏行。 |
 
 ### 2.3 SQL 改写与绕过防护（8 个执行单元）
@@ -106,16 +106,13 @@
 | RCAC-033 | 间接读取边界 | 导出/物化/函数可达入口 | 仅列举目标版本实际可用、受控用户有权限的 SELECT INTO/CTAS/stage 或函数间接读取入口；分别记录执行身份、受限结果或拒绝 | 不把这些入口宣称为已交付正向能力；可达入口若返回/导出隐藏行列，记安全失败。不存在的接口不造测试，不展开通用函数与导出全矩阵。 |
 | RCAC-036 | 优化回归 | predicate pushdown/index | 策略行 filter 与用户谓词、索引、JOIN reorder 组合 | 优化后等价于安全基线；不得因下推/重排丢策略。 |
 
-### 2.4 多角色合并（6 个执行单元）
+### 2.4 角色生效与继承（1 个执行单元）
 
 | 编号 | 二级模块 | 测试场景 | 测试步骤 | 预期结果 |
 | --- | --- | --- | --- | --- |
-| RCAC-037 | 合并 | 两/三角色不同基础行相同投影 | t(a,marker)={(1,1),(1,2),(2,3)}；R1命中marker=1，R2命中marker=2，均投影a；显式激活。再加第三个相同来源/投影、含重叠与独有行的角色 | 两角色 SELECT a 返回两个1，COUNT(*)=2；DISTINCT才返回一个1；三兼容角色结果等于基础行predicate OR。不能沿用旧result的count=1；仅兼容组验证顺序不改变结果。 |
-| RCAC-038 | 合并 | 两角色命中同一基础行 | R1/R2 同时命中 `(1,1)`，查询主键、普通投影及 count | 同一基础行只一次，来自 OR 过滤而非对结果做 DISTINCT。 |
-| RCAC-040 | 兼容判定 | 表达式/来源精确匹配 | 分别配置不同列、同名列但表达式交换、列顺序/别名差异、相同逐行表达式、不同来源 | 仅实现定义的完全兼容形态合并；不能以“列名集合规范化”替代表达式/来源比较。 |
-| RCAC-041 | 不兼容 | 不可合并形态覆盖 | 覆盖不同投影、ORDER BY/LIMIT、聚合、窗口等；改变 role 加载/启用顺序并记录 SHOW、活动角色和最终查询 | 当前实现按后加载的有效 rule 覆盖前者；不得取列集并集。若实现改为拒绝，才改为安全错误 Oracle。 |
-| RCAC-042 | 混合语义 | 兼容合并后的 JOIN/聚合/分页 | 以 RCAC-037 的两条 `a=1` 基础行为 seed，对 JOIN、COUNT、LIMIT/OFFSET 和 DISTINCT 分别执行 | 原 SQL 语义在基础行 OR 后执行；普通投影/COUNT 保留两行，DISTINCT 才去重。 |
-| RCAC-043 | 角色生效集 | primary/secondary与继承 | 分别 SET ROLE、SECONDARY ROLE ALL/NONE；以一次角色继承/默认登录作控制，记录每步活动角色和结果 | 拥有角色不等于激活；ALL不改变primary role；规则来自真实生效集，不隐式提权。 |
+| RCAC-043 | 角色生效集 | 显式切换、兼容操作与继承 | 分别执行 SET ROLE、SECONDARY ROLE ALL/NONE；以一次角色继承/默认登录作控制，记录每步活动角色和结果 | SET ROLE 使用目标活跃角色；ALL/NONE 成功但不改变调用前的活跃角色和结果，不自动激活其他授予角色；继承按已交付行为验证，不隐式提权。 |
+
+原 RCAC-037、038、040、041、042（含原 039）依赖多活跃角色共同生效或角色合并，移出本期端到端验收，不标记为通过；若将来交付多活跃角色支持，需重新定义范围及 Oracle。历史执行结果继续保留：RCAC-040 的部分 merge-shape 单测和 RCAC-041 的后规则覆盖 BVT 曾通过，仅作为组件/回归证据，不证明多活跃角色端到端行为。历史不同基础行相同投影的安全 seed 和旧 OR Oracle 也可为未来需求追溯，不改变本期结论。
 
 ### 2.5 缓存、错误与对象生命周期（3 个执行单元）
 
@@ -131,7 +128,7 @@
 
 每条受控查询都用管理员在独立基线中手工套用已冻结的行 predicate 和允许列集，生成安全 Oracle。比较完整行集合、列集合、聚合、排序和分页，而不只比较返回行数。
 
-多角色 Oracle 为：先按当前实现判断每个有效角色 rule 的 SELECT 形态、投影表达式列表和来源是否完全兼容。兼容时，管理员基线以 `WHERE (P1) OR (P2) ... OR (Pn)` 计算基础行可见集合；同一基础行最多一次。随后在该基础行集合上执行原用户 SQL 的投影、JOIN、聚合、排序、LIMIT/OFFSET 与集合运算。不同基础行产生的相同投影值必须保留，除非原用户 SQL 自身包含 `DISTINCT`、`UNION` 等去重语义。不兼容时，以当前“后加载有效 rule 覆盖”计算 Oracle，记录角色加载顺序；绝不采用列集并集。接口未来若改为拒绝冲突，需在变更提交中同步更新本 Oracle。
+角色 Oracle 以调用时真实活跃角色及其已交付继承行为为准：显式 `SET ROLE` 切换到目标角色；`SET SECONDARY ROLE ALL/NONE` 成功但不改变调用前的活跃角色或查询结果。管理员基线按该有效策略过滤基础行后，再执行原 SQL 的投影、JOIN、聚合、排序、LIMIT/OFFSET 与集合操作；不同授权基础行产生相同投影时仍须遵循原 SQL 的去重语义。不得将分别授予的角色默认当成同时生效，也不得把历史多角色 OR Oracle 写成本期已通过能力。
 
 ### 3.2 权限与错误路径判定
 
@@ -140,7 +137,6 @@
 | 无对象权限 | 由 RBAC 拒绝，与 rule 是否存在无关。 |
 | 有对象 SELECT 但没有 rule / 删除 rule 后已刷新 session | 保留原 SQL，返回 RBAC 允许的数据；这不是 fail-closed 场景。 |
 | 有 rule 但无对象 SELECT | RBAC 拒绝，rule 不授予对象访问。 |
-| 列集/规则不可合并 | 按当前后加载规则覆盖；不得采用列集并集。 |
 | 策略 metadata/解析/加载/缓存失败 | 拒绝该查询，提供安全错误。 |
 | 不可安全改写的 SQL/函数/动态规则 | 拒绝或使用已验证的保守执行路径。 |
 | 旧 plan、跨 CN cache、角色撤销未同步 | 当前只以 `SET ROLE` 或重连后的结果为生效 Oracle；刷新前的旧结果必须单独记录为交付风险，不能声称全局即时失效。 |
@@ -149,7 +145,7 @@
 
 - 记录精确 MatrixOne commit、实际 rule SQL、`mo_role_rule` 元数据、用户/角色/account 拓扑、primary/secondary role 状态、`enable_remap_hint`/session/inline remap、CN/TN 数、对象权限、表数据 seed 和每个 role 的预期行/列集合。
 - 每条绕过防护用例附原 SQL、EXPLAIN、改写证据、管理员安全 Oracle 与受控实际结果；错误日志不得包含未授权数据。
-- 多角色用例记录每条 rule 的 predicate、基础行主键集合、投影表达式列表与来源、OR 基线、用户 SQL 结果及相同投影值对应的不同基础行数。不兼容时，额外记录有效角色顺序、覆盖行为和最终生效 rule。
+- 角色用例记录 `SET ROLE`、ALL/NONE 前后当前活跃角色、有效 rule 和查询结果；继承用例记录授权链与实际生效策略。历史多角色 OR 结果单独保留，不作为当前验收通过证据。
 - 缓存/撤销用例记录 A/B session、变更时间、session/CN、是否热缓存、`SET ROLE`/重连/prepare 再执行的每一步结果及实际生效时间；全局跨 session/CN 未承诺的状态不得标为通过。
 - 安全缺陷附最小复现、user/role/object、策略版本、SQL、预期/实际泄露行或列，并按最高优先级处理。
 
@@ -157,7 +153,8 @@
 
 | 入口 | 本设计映射 | 使用约束 |
 | --- | --- | --- |
-| `test/distributed/cases/zz_accesscontrol/role_rule.sql` | 001/004/007/037/038/040/041/043/046 | 复用管理语法、授权、角色开关与数据搭建；按目标SHA重跑，不能照抄陈旧.result的多角色count=1。 |
-| `pkg/frontend/rewrite_rule.go` 的规则验证、合并和缓存路径 | 006/008/011/025/040/041/046/051 | 为错误/交错/加载边界补直接证据；源码位置不是执行通过证明。 |
+| `test/distributed/cases/zz_accesscontrol/role_rule.sql` | 001/004/007/043/046 | 复用管理语法、授权与数据搭建；按目标 SHA 运行。历史合并相关结果不作为多活跃角色验收证据。 |
+| `test/distributed/cases/zz_accesscontrol/secondary_role_disabled.sql` | 043 | 复用 ALL/NONE 保持活跃角色、拒绝次要角色权限及显式切换的回归；按目标 SHA 验证。 |
+| `pkg/frontend/rewrite_rule.go` 的规则验证与缓存路径 | 006/008/011/025/046/051 | 为错误/交错/加载边界补直接证据；历史内部合并单测独立保留。源码位置不是执行通过证明。 |
 
 以[研发review](https://github.com/matrixorigin/matrixone/issues/23271#issuecomment-5747326189)及目标版本冻结契约判定。开关/覆盖规则可绕过、名称复用泄露、跨session即时撤销缺失须登记差距；不能仅因当前实现如此就宣布安全验收通过。本文只完成设计评审，未执行SQL/BVT。
