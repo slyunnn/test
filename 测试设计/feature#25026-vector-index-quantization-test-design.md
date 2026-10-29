@@ -148,12 +148,12 @@
 
 以下按 Feature 设计保留测试，不因代码已有拒绝逻辑或测试工具忽略元数据而改写为通过。记录基线 SHA、具体类型/SQL、实际错误和证据；若研发确认 Feature 文档需要调整，再同步修改本设计。
 
-| 覆盖点 | Feature 设计预期 | 已观察到的实现行为（`main@95341b4`，或另行标注） | 判定与后续 |
+| 覆盖点 | Feature 设计预期 | 已观察到的实现行为（`main@7597f979`） | 判定与后续 |
 | --- | --- | --- | --- |
-| VQ-016/019 | IVFFLAT int8/uint8 量化不限 GPU 的 L2-only 限制，覆盖 IP/cosine/L1 | `main@23488e1` 本地 L2/L2SQ 成功，IP/cosine/L1 被拒绝 | 记录不符合 Feature 的结果；按当前 main 复核并交研发确认，不自动改为负例通过。 |
-| VQ-046/049 | 四种窄类型支持求和、范数及 subvector | `main@23488e1` 对四种窄类型被拒绝；部分旧 BVT 固定为拒绝 | 保留 Feature 正例与原始错误，确认是否为研发设计或实现缺口；不能直接更新 expected。 |
-| VQ-047 | normalize_l2 返回与输入相同的向量类型 | `main@23488e1` 的 int8/uint8 返回 vecf32 | 记录返回类型和值，待研发确认；浮点与整数分别断言。 |
-| VQ-050 | Feature 将 inner_product 描述为 dot product | `main@23488e1` 本机返回负点积，现有实现用于距离排序 | 同时记录标量数值与排序方向；符号以研发确认后的 Feature 契约为准，不能仅凭函数名作判断。 |
+| VQ-016/019 | IVFFLAT int8/uint8 量化不限 GPU 的 L2-only 限制，覆盖 IP/cosine/L1 | 本地 L2/L2SQ 成功，IP/cosine/L1 被拒绝；代码说明 affine quantizer 的度量限制 | 记录不符合 Feature 的结果并交研发确认，不自动改为负例通过。 |
+| VQ-046/049 | 四种窄类型支持求和、范数及 subvector | 四种窄类型被拒绝；部分旧 BVT 固定为拒绝 | 保留 Feature 正例与原始错误，确认是否为研发设计或实现缺口；不能直接更新 expected。 |
+| VQ-047 | normalize_l2 返回与输入相同的向量类型 | int8/uint8 返回 vecf32；f16/bf16 返回同类型 | 记录返回类型和值，待研发确认；浮点与整数分别断言。 |
+| VQ-050 | Feature 将 inner_product 描述为 dot product | 本机返回负点积，现有实现用于距离排序 | 同时记录标量数值与排序方向；符号以研发确认后的 Feature 契约为准，不能仅凭函数名作判断。 |
 | VQ-042 | 旧索引升级后仍可访问 | 旧数据升级当前 main 时 catalog admission 失败，升级后断言未执行，见 [#31649](https://github.com/matrixorigin/matrixone/issues/31649) | 测试已执行并发现阻塞 Issue；记录为“已执行、被 Issue 阻塞”，不是升级断言通过。修复后针对阻塞断言回归。 |
 | BVT 元数据 | 严格比较结果及元数据 | 部分失败与 JDBC 类型或测试器空结果解析有关；关闭元数据比对仅是诊断 | 分别记录严格结果与数值对照；定位工具/产品/预期原因后再修复或提 Issue，不把忽略元数据的结果记为严格通过。 |
 
