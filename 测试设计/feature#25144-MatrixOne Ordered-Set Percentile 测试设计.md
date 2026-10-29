@@ -119,7 +119,7 @@
 | PCT-R034 | Fill/merge不变性 | 同一输入单/多batch、两/四路交错切分，在重叠/独有group上局部聚合再merge，含空partial | 结果与全量一次聚合及Oracle一致，group映射无串扰；各批次/切分控制有直接结果，不要求任意并行度压力矩阵。 |
 | PCT-R036 | 内存状态 round-trip | 无 spill 状态序列化/反序列化后 merge/flush | 等于未序列化状态和 Oracle。 |
 | PCT-R037 | merge 配置不一致 | p、方向、类型不一致的 state merge | 拒绝 merge；状态仍可 Free。 |
-| PCT-R038 | 损坏状态 | 截断、未知版本、非法长度序列化 state | 返回错误，无越界/panic/泄漏。 |
+| PCT-R038 | 损坏状态与配置版本 | 对实际序列化 state 构造截断、负长度及超出剩余数据长度；对带版本标记的 percentile 配置单独构造未知版本 | 不合法输入返回错误，无越界/panic/泄漏，解码失败后的原 state 仍可使用和 Free。当前 state 编码无独立版本字段，不能构造真正的 state 未知版本；若后续引入版本字段，再增加 state 未知版本拒绝验证。配置版本检查不得冒充 state 版本检查。 |
 | PCT-R039 | MORPC门禁 | 复用remote_expr_test.go的v16/v17发送/接收能力边界，分别构造可拒绝及可执行路径 | 不支持版本明确拒绝而非丢失ordered-set配置；支持版本结果与本地一致。记录精确本地/远端版本，不由门禁UT推导混合版本部署已支持。 |
 
 ### 3.2 Spill、compaction与限制组合（5 个执行单元）
