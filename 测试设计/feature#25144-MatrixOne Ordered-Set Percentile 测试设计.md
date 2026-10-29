@@ -4,7 +4,7 @@
 
 > 2026-10-28 必要项评审：60 条收敛为 36 个执行单元；保留原review修正的MVP、类型、独立Oracle及不支持组合，原编号不重排。合入PR #26781的参考提交为`f6889dd2a90077aa4fbe46e66ad91e02b36966cf`；实际执行仍按1.1冻结目标SHA并核对后续变更。本文未执行数据库/UT。
 
-> 2026-10-29 合同修订：结合已合并的 [#28540](https://github.com/matrixorigin/matrixone/pull/28540)、[#29106](https://github.com/matrixorigin/matrixone/pull/29106)、[#29130](https://github.com/matrixorigin/matrixone/pull/29130) 和 [#29035](https://github.com/matrixorigin/matrixone/pull/29035)，调整 R027/R030/R031/R032/R043。PCT-R024 的 NaN 排序与 [#28854](https://github.com/matrixorigin/matrixone/issues/28854) 存在相反预期，保留原断言及争议，不在本次自行定论。设计修订不表示相关测试已通过。
+> 2026-10-29 合同修订：结合已合并的 [#28540](https://github.com/matrixorigin/matrixone/pull/28540)、[#29106](https://github.com/matrixorigin/matrixone/pull/29106)、[#29130](https://github.com/matrixorigin/matrixone/pull/29130) 和 [#29035](https://github.com/matrixorigin/matrixone/pull/29035)，调整 R027/R030/R031/R032/R043。R024 按 [#26956](https://github.com/matrixorigin/matrixone/pull/26956) 的 SQL 排序及 [#28854](https://github.com/matrixorigin/matrixone/issues/28854) 修正：ASC/DESC 下 NaN 均在普通数值之后。设计修订不表示相关测试已通过。
 
 ## 1. 测试原则
 
@@ -40,7 +40,7 @@
 | 支持类型 | CONT 支持数值类型及支持范围内的 DECIMAL64/128；DISC 另支持 VARCHAR、DATE、DECIMAL256 等可排序标量，仍拒绝 JSON、array/vector。 |
 | NULL 输入值 | 不参与排序、有效行数和计算；空集合或全 NULL 返回 NULL。 |
 | NULL percentile 参数 | 拒绝 NULL 常量和执行期绑定的 NULL 参数；此点与 PostgreSQL 的 NULL 返回行为不同，作为兼容性差异记录。 |
-| NaN/Infinity | 本期作为合法浮点输入冻结：ASC 下 NaN 位于普通数值前，DESC 下位于普通数值后；选中/插值端点为 NaN 时 CONT 返回 NaN；`-Inf < 有限值 < +Inf`。 |
+| NaN/Infinity | 本期作为合法浮点输入冻结：ASC 和 DESC 下 NaN 均位于普通数值之后，与 SQL `ORDER BY` 一致；选中/插值端点为 NaN 时 CONT 返回 NaN；`-Inf < 有限值 < +Inf`。 |
 | 分布式限制 | 仅内存 partial 源支持序列化和作为来源 merge；终态目标可本地 spill 并接收内存 partial，不因此推断跨 CN 传输 spilled partial 已支持。 |
 
 ### 1.3 必要覆盖与精简说明
@@ -96,7 +96,7 @@
 | PCT-R020 | 无符号与超2^53 DISC | UINT8/16/32/64含0/上界邻值；独立2^53、2^53+1，p=0/1及中间秩 | unsigned原生顺序正确，DISC精确返回输入值及同类型；不得经float64导致相邻大整数排序塌缩。 |
 | PCT-R022 | 超 2^53 的 CONT | 相邻超大整数及非端点 p | 用 `float64` 标准舍入作为预期；检查返回 float64，不要求原十进制精确。 |
 | PCT-R023 | FLOAT32/FLOAT64 有限值 | 正负、小数、重复，多 p | 使用 IEEE bit pattern 或声明 ULP 容差比较。 |
-| PCT-R024 | NaN 排序与结果 | ASC/DESC 下含 NaN；使 NaN 落在选中秩/插值端点 | ASC NaN 在普通值前、DESC 在后；选中/参与插值时 CONT 返回 NaN；内存与 spill 一致。 |
+| PCT-R024 | NaN 排序与结果 | ASC/DESC 下含 NaN、有限值及 ±Inf；使 NaN 落在选中秩/插值端点，分别验证内存及 spill | ASC/DESC 下 NaN 均在普通值后，与 SQL `ORDER BY` 一致；选中/参与插值时 CONT 返回 NaN；内存与 spill 一致。 |
 | PCT-R025 | Infinity | 含 `-Inf`、有限值、`+Inf` 的 ASC/DESC | 排序为 `-Inf < 有限值 < +Inf`；端点和 DISC 返回契约一致。 |
 | PCT-R026 | DECIMAL64 | 固定 scale 的插值/离散 p | Oracle 比较 unscaled value、scale、结果类型；不经 float64。 |
 | PCT-R027 | DECIMAL128/限制 | 合法精度与最大精度，分别验证 CONT 与 DISC 的 DECIMAL256 | 支持范围正确；CONT 的 DECIMAL256/不支持宽度稳定报错；DISC 的 DECIMAL256 精确返回输入值及类型。 |
