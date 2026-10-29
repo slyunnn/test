@@ -1,17 +1,19 @@
 # MatrixOne Ordered-Set Percentile 测试设计（必要项评审版）
 
-> 本文依据 `MatrixOne_Ordered-Set-Percentile_测试方案分析.md` 修订，覆盖 Issue [#25144](https://github.com/matrixorigin/matrixone/issues/25144) 当前的标量 MVP：`PERCENTILE_CONT` 与 `PERCENTILE_DISC`。窗口形式、动态 percentile 参数、非数值排序表达式及 DECIMAL256 不属于本期支持范围。
+> 本文依据 `MatrixOne_Ordered-Set-Percentile_测试方案分析.md` 修订，覆盖 Issue [#25144](https://github.com/matrixorigin/matrixone/issues/25144) 的 `PERCENTILE_CONT` 与 `PERCENTILE_DISC`，并纳入后续已合并的 prepared 参数、ordered-set window 与 DISC 可排序类型扩展。按输入行或分组变化的 percentile 参数仍不支持。
 
 > 2026-10-28 必要项评审：60 条收敛为 36 个执行单元；保留原review修正的MVP、类型、独立Oracle及不支持组合，原编号不重排。合入PR #26781的参考提交为`f6889dd2a90077aa4fbe46e66ad91e02b36966cf`；实际执行仍按1.1冻结目标SHA并核对后续变更。本文未执行数据库/UT。
+
+> 2026-10-29 合同修订：结合已合并的 [#28540](https://github.com/matrixorigin/matrixone/pull/28540)、[#29106](https://github.com/matrixorigin/matrixone/pull/29106)、[#29130](https://github.com/matrixorigin/matrixone/pull/29130) 和 [#29035](https://github.com/matrixorigin/matrixone/pull/29035)，调整 R027/R030/R031/R032/R043。PCT-R024 的 NaN 排序与 [#28854](https://github.com/matrixorigin/matrixone/issues/28854) 存在相反预期，保留原断言及争议，不在本次自行定论。设计修订不表示相关测试已通过。
 
 ## 1. 测试原则
 
 | 项目 | 说明 |
 | --- | --- |
-| 功能定位 | 两函数是精确 ordered-set 标量聚合；`WITHIN GROUP (ORDER BY ...)` 决定聚合内部顺序，与最终输出行排序独立。 |
+| 功能定位 | 两函数是精确 ordered-set 聚合，支持标量/分组与 `OVER` 窗口；`WITHIN GROUP (ORDER BY ...)` 决定聚合内部顺序，与最终输出行排序独立。 |
 | 数学语义 | CONT 使用 `r = 1 + p × (N - 1)` 后对相邻秩线性插值；DISC 返回排序后累计分布首次达到 p 的实际输入值。 |
-| MVP 边界 | 仅常量且非 NULL 的有限 p，范围 `[0,1]`；窗口形式、动态/NULL p、非数值排序列、DECIMAL256 须稳定拒绝。 |
-| 路径隔离 | 内存 partial merge、独立 spill、远程多 CN merge 分别验证；带 spill runs 的序列化/partial merge 是当前明确不支持组合。 |
+| 参数边界 | p 可为常量或单次 EXECUTE 内固定的 prepared 参数及支持的表达式；必须非 NULL、有限且位于 `[0,1]`。列引用及逐行/逐组变化的 p 须拒绝。 |
+| 路径隔离 | 内存 partial merge、独立 spill、远程多 CN merge 分别验证；含 spill runs 的 partial 源状态不得序列化或作为来源 merge，终态目标可接收内存 partial 并在本地 spill。 |
 | 类型契约 | DISC 保留输入类型；CONT 对非 DECIMAL 返回 float64。因此大整数 CONT 按 IEEE-754 float64 舍入判定，不要求任意大整数十进制精确。 |
 | 独立 Oracle | 测试侧排序、rank、插值与转换不得复用生产排序器、rank 计算器或类型转换实现。 |
 | 分层门禁 | SQL/BVT验证语义，UT验证状态/编码/spill生命周期，多CN验证真实远程merge与取消。只保留直接改动风险，不追加通用性能/长稳。 |
@@ -34,12 +36,12 @@
 | 项目 | 内容 |
 | --- | --- |
 | 功能入口 | `PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY expr [ASC\|DESC])`；`PERCENTILE_DISC(p) WITHIN GROUP (ORDER BY expr [ASC\|DESC])` |
-| 实现参考 | PR [#26781](https://github.com/matrixorigin/matrixone/pull/26781)；实际验收以 1.1 冻结的 commit 为准。 |
-| 支持类型 | signed/unsigned integer、float、DECIMAL64、支持范围内的 DECIMAL128。 |
+| 实现参考 | PR [#26781](https://github.com/matrixorigin/matrixone/pull/26781)、[#28540](https://github.com/matrixorigin/matrixone/pull/28540)、[#29106](https://github.com/matrixorigin/matrixone/pull/29106)、[#29130](https://github.com/matrixorigin/matrixone/pull/29130)、[#29035](https://github.com/matrixorigin/matrixone/pull/29035)；实际验收以 1.1 冻结的 commit 为准。 |
+| 支持类型 | CONT 支持数值类型及支持范围内的 DECIMAL64/128；DISC 另支持 VARCHAR、DATE、DECIMAL256 等可排序标量，仍拒绝 JSON、array/vector。 |
 | NULL 输入值 | 不参与排序、有效行数和计算；空集合或全 NULL 返回 NULL。 |
-| NULL percentile 参数 | MatrixOne 当前 MVP 明确拒绝（`p` 必须为非 NULL 常量）；此点与 PostgreSQL 的 NULL 返回行为不同，作为兼容性差异记录。 |
+| NULL percentile 参数 | 拒绝 NULL 常量和执行期绑定的 NULL 参数；此点与 PostgreSQL 的 NULL 返回行为不同，作为兼容性差异记录。 |
 | NaN/Infinity | 本期作为合法浮点输入冻结：ASC 下 NaN 位于普通数值前，DESC 下位于普通数值后；选中/插值端点为 NaN 时 CONT 返回 NaN；`-Inf < 有限值 < +Inf`。 |
-| 分布式限制 | 仅内存状态支持序列化和 partial merge；含 spill runs 的状态序列化/partial merge 必须拒绝。 |
+| 分布式限制 | 仅内存 partial 源支持序列化和作为来源 merge；终态目标可本地 spill 并接收内存 partial，不因此推断跨 CN 传输 spilled partial 已支持。 |
 
 ### 1.3 必要覆盖与精简说明
 
@@ -53,7 +55,7 @@
 | 生命周期与取消 | 3 | 释放/重建、单CN与多CN取消 |
 | **合计** | **36** | 合并fixture共享数据，不省略独立路径断言 |
 
-001吸收002/003/009/010；005吸收006并随用例采008计划；020吸收021；028吸收029；034吸收033/035；043分别检查原043/044两种拒绝；046吸收047/048的释放断言。删除独立通用事务052、重复执行长稳051及053..060规模化性能/approx对照。保留有界随机Oracle，不以海量压测代替正确性。单CN强制spill与多CN内存merge必须分开，绝不把“分布式+spill成功”新增为支持承诺。
+001吸收002/003/009/010；005吸收006并随用例采008计划；020吸收021；028吸收029；034吸收033/035；043分别检查 spilled 来源拒绝与终态目标接收的正确性；046吸收047/048的释放断言。删除独立通用事务052、重复执行长稳051及053..060规模化性能/approx对照。保留有界随机Oracle，不以海量压测代替正确性。单CN强制spill与多CN内存merge必须分开，不把跨 CN 传输 spilled partial 当作已支持。
 
 ### 1.4 现有覆盖映射
 
@@ -97,16 +99,16 @@
 | PCT-R024 | NaN 排序与结果 | ASC/DESC 下含 NaN；使 NaN 落在选中秩/插值端点 | ASC NaN 在普通值前、DESC 在后；选中/参与插值时 CONT 返回 NaN；内存与 spill 一致。 |
 | PCT-R025 | Infinity | 含 `-Inf`、有限值、`+Inf` 的 ASC/DESC | 排序为 `-Inf < 有限值 < +Inf`；端点和 DISC 返回契约一致。 |
 | PCT-R026 | DECIMAL64 | 固定 scale 的插值/离散 p | Oracle 比较 unscaled value、scale、结果类型；不经 float64。 |
-| PCT-R027 | DECIMAL128/限制 | 合法精度与最大精度、DECIMAL256 | 支持范围正确；不支持 CONT/DECIMAL256 稳定报错。 |
+| PCT-R027 | DECIMAL128/限制 | 合法精度与最大精度，分别验证 CONT 与 DISC 的 DECIMAL256 | 支持范围正确；CONT 的 DECIMAL256/不支持宽度稳定报错；DISC 的 DECIMAL256 精确返回输入值及类型。 |
 
 ### 2.4 分布式与负例（4 个执行单元）
 
 | 编号 | 场景 | 测试步骤 | 预期结果 |
 | --- | --- | --- | --- |
 | PCT-R028 | 单/多CN内存merge | 同一快照分别无group/有group，含倾斜、NULL、重复、大整数，CONT/DISC及ASC/DESC；证明实际远程partial merge | 逐group与单CN/独立Oracle一致，无串组；必须保持内存状态，不把spill失败解释成已支持远程spill。一个CN数控制与一个真实多CN拓扑足够。 |
-| PCT-R030 | percentile形态 | p为列/依赖行的表达式、参数占位符、p<0、p>1、NaN/Inf | 按MVP拒绝动态/参数化及非有限越界p，错误类别稳定；不要将可常量折叠的表达式无差别归为动态参数。 |
-| PCT-R031 | 不支持 SQL | 缺 WITHIN GROUP、多排序键、`OVER()` | 分别报 requires WITHIN、exactly one expression、window unsupported 类错误。 |
-| PCT-R032 | 不支持排序类型 | varchar、JSON、日期、DECIMAL256 | 明确拒绝，不隐式转换、无 panic。 |
+| PCT-R030 | percentile形态 | 同一 prepared 语句使用多个有效参数、算术/CAST；分别测试 NULL、越界、NaN/Inf、列及依赖行表达式，并验证有效—无效—有效复用 | 执行期固定参数及支持的表达式按各次绑定值正确计算且不复用旧值；非法参数和行依赖表达式稳定拒绝，后续有效执行不受污染。 |
+| PCT-R031 | SQL 形态与窗口 | 缺 WITHIN GROUP、多排序键；CONT/DISC 的 `OVER()`、分区及 ASC/DESC，与独立逐分区 Oracle 比较 | 缺 WITHIN 和多排序键分别稳定报错；支持的窗口形态返回正确分区结果、行数和类型，无 panic。 |
+| PCT-R032 | 排序类型边界 | DISC 的 VARCHAR、DATE、DECIMAL256 和 JSON/array；CONT 的非数值与 DECIMAL256 | DISC 对支持类型精确返回输入值并保留类型，JSON/array 稳定拒绝；CONT 对不支持类型稳定拒绝，不隐式转换、无 panic。 |
 
 ## 3. 实现可靠性（13 个执行单元）
 
@@ -127,7 +129,7 @@
 | PCT-R040 | 独立 spill | 使用实际生效阈值（不写“设置为 1”），以足够输入字节触发 spill | 记录阈值、行数、估计字节、spill runs；结果等于内存 Oracle。 |
 | PCT-R041 | 多 run/compaction | 构造足够数据产生多个 run 和可观测 compaction | 记录 run 数、compaction、spill rows、peak memory；无丢/重行。 |
 | PCT-R042 | spill 特殊值 | NULL、重复、NaN、超 2^53、DECIMAL 分别执行 | 与内存路径及类型契约一致。 |
-| PCT-R043 | spill不支持组合 | 独立构造含真实spill runs状态，分别尝试序列化、作为源/目标partial merge（覆盖实现可达方向） | 序列化与merge均稳定报不支持，不错误成功、不丢runs；失败后可Free。两种入口分别留证，不能以未执行代替拒绝通过。 |
+| PCT-R043 | spill 源拒绝与终态目标 | 独立构造含真实 spill runs 的来源 state，验证序列化和作为 merge 来源；另构造已有本地 runs 的终态目标，多次接收内存 partial，与无 spill 基线和独立 Oracle 比较，检查 runs 与 Free | spilled 来源的序列化/merge 稳定拒绝、runs 不丢失；终态目标正确接收内存 partial，结果与基线/Oracle 一致且释放资源。两条路径分别留证；不能以 merge 返回成功替代结果和清理验证，也不能推断远程 spilled partial 支持。 |
 | PCT-R045 | spill I/O错误 | 在运行期注入写/读或目录错误，选择能覆盖创建与已创建run的失败点 | 错误明确传播；部分初始化状态可Free，mpool/临时文件回收，后续健康聚合正常；不做无关系统故障全矩阵。 |
 
 ### 3.3 生命周期、取消与资源（3 个执行单元）
@@ -154,5 +156,5 @@
 - 所有门禁结果必须包含第 1.1 节全部冻结项、SQL、数据 seed、预期/实际、返回类型、CN 数与执行计划。
 - spill 结果额外记录实际阈值、输入行数/估计字节、spill run 数、compaction、spill rows、peak memory、临时文件清理状态。
 - 浮点/大整数失败必须给出输入排序序列、p、rank、插值端点、期望 float64 位模式或 ULP、实际值和类型。
-- PCT-R043合并的spill序列化/partial merge两种不支持入口，只有分别稳定拒绝才通过；不得因未执行而算成功。
+- PCT-R043 分别记录 spilled 来源序列化/merge 的拒绝，以及终态目标接收内存 partial 的结果、runs 和清理；未执行的入口不得算通过。
 - 取消/释放用例保留mpool、临时文件及远端退出证据；不能以“未panic”替代数值与资源正确性。
