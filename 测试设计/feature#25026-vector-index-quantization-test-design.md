@@ -74,9 +74,9 @@
 | --- | --- | --- | --- | --- |
 | VQ-004 | IVFFLAT基类型 | 全部基类型无量化 | f32/f64/f16/bf16/int8/uint8分别建无量化IVFFLAT，含整型边界小fixture；采SHOW、entries和EXPLAIN，检索 | entries保持基类型；原值不变。用lists=1且覆盖全部候选的可判定fixture核对距离/Top-K；符号、f64及新增窄类型各有证据。 |
 | VQ-015 | IVFFLAT量化 | 浮点entries及无量化对照 | 固定f32原表，分别不量化及QUANTIZATION float32/float16/bf16；至少一组窄基类型转换控制，检查SHOW/entries与检索 | 原列类型和值不变；entries按目标类型存储，省略保持基类型；用转换后Oracle解释距离差异，不强求与原始f32完全相同排序。 |
-| VQ-016 | IVFFLAT量化 | int8/uint8及度量范围 | f32分别整数量化并查询；覆盖int8/uint8和L2/L2SQ、IP/cosine、L1的代表合法组合；关联018..020 | IVFFLAT不套GPU的L2-only限制；配置与entries正确。以独立转换/距离Oracle和061质量集判定，不仅要求SQL成功。 |
+| VQ-016 | IVFFLAT量化 | int8/uint8及度量范围 | f32分别整数量化；对两种量化分别覆盖 L2/L2SQ 合法控制及 IP/cosine/L1 建索引负例；关联018..020 | L2/L2SQ 可用，配置、entries及查询正确；IP/cosine/L1 拒绝并报 20105、无残留。以独立转换/距离Oracle和061质量集判定，不仅要求SQL成功。 |
 | VQ-018 | 算子 | L2/L2SQ数值 | 在相同已存表示与候选集上比较L2和L2SQ，含窄浮点和整数 | 数值满足sq=l2²容差；无并列确定fixture排序一致。不同训练/候选的ANN检索不要求任意结果完全相同。 |
-| VQ-019 | 算子 | IP/cosine | IVFFLAT对浮点和整数entries执行IP/cosine，含零向量控制；GPU合法浮点组合关联024/027 | 数值及排序方向按算子契约与独立Oracle核对；GPU整数负例由039负责，不以IVF正例推导GPU支持。 |
+| VQ-019 | 算子 | IP/cosine | IVFFLAT对浮点量化及无量化整数基列执行IP/cosine，含零向量控制；int8/uint8 量化负例关联016；GPU合法浮点组合关联024/027 | 数值及排序方向按算子契约与独立Oracle核对；整数基列无量化不等于整数 QUANTIZATION。 |
 | VQ-020 | 算子 | L1 | IVFFLAT 全基类型使用 L1 | 支持并正确；GPU 索引不应误接受 L1。 |
 | VQ-021 | DML/事务 | 量化条目写入与回滚 | 新增、更新向量和删除；分别commit/rollback后查询，含一个窄基类型与一个f32→窄entries代表组合 | 提交可见、回滚不可见；旧向量/删除行不作为有效结果；原表及索引不互相污染。各算法更新链路与032关联，无需每个类型重复全事务矩阵。 |
 | VQ-023 | 训练 | 小样本/训练参数边界 | lists 与训练比例接近行数边界，执行建索引/查询 | 失败时错误清晰且无残留；成功时索引稳定。 |
@@ -104,9 +104,9 @@
 | --- | --- | --- | --- | --- |
 | VQ-045 | 单目 | `vector_dims` | 各维度/类型调用 | 返回 int64 且等于声明维度。 |
 | VQ-046 | 单目 | `summation`、`l1_norm`、`l2_norm` | 负数、零、正数、整数边界输入 | 数值符合 f32 基线与 epsilon。 |
-| VQ-047 | 单目 | normalize_l2含零向量 | 四种窄类型输入非零/零向量，对比独立f32计算后按返回类型转换的Oracle，核对返回类型 | 返回同类型；浮点非零结果norm约1（按精度），整数结果按转换契约，不能统一断言norm=1；零向量行为冻结，无未解释NaN/panic。 |
+| VQ-047 | 单目 | normalize_l2含零向量 | 四种窄类型输入非零/零向量，对比独立f32计算后按返回类型转换的Oracle，核对返回类型 | f16/bf16 返回原类型，int8/uint8 返回 vecf32；非零结果按对应精度验证，零向量行为冻结，无未解释NaN/panic。 |
 | VQ-049 | 单目 | `subvector` | start=1、末尾、负 start、有/无 len | 1 基索引、负索引和长度边界正确，返回同类型。 |
-| VQ-050 | 双目 | `inner_product` | 同/异类型可支持组合与向量字面量 | 数值正确，结果为 float64。 |
+| VQ-050 | 双目 | `inner_product` | 同/异类型可支持组合与向量字面量 | 返回负点积、结果为 float64；数值和距离排序方向正确。 |
 | VQ-051 | 双目 | cosine similarity/distance | 正交、相同、反向和零向量 | 数值范围/互补关系正确；零向量契约一致。 |
 | VQ-052 | 双目 | `l2_distance`/`l2_distance_sq` | 多类型、负值、整型边界 | 满足平方关系，结果为 float64。 |
 | VQ-055 | 编码 | `vec*_from_base64` | 六种类型合法/截断/非法 base64 输入 | 合法输入得到正确类型和维度；非法输入明确失败。 |
@@ -150,10 +150,10 @@
 
 | 覆盖点 | Feature 设计预期 | 已观察到的实现行为（`main@7597f979`） | 判定与后续 |
 | --- | --- | --- | --- |
-| VQ-016/019 | IVFFLAT int8/uint8 量化不限 GPU 的 L2-only 限制，覆盖 IP/cosine/L1 | 本地 L2/L2SQ 成功，IP/cosine/L1 被拒绝；代码说明 affine quantizer 的度量限制 | 记录不符合 Feature 的结果并交研发确认，不自动改为负例通过。 |
-| VQ-046/049 | 四种窄类型支持求和、范数及 subvector | 四种窄类型被拒绝；部分旧 BVT 固定为拒绝 | 保留 Feature 正例与原始错误，确认是否为研发设计或实现缺口；不能直接更新 expected。 |
-| VQ-047 | normalize_l2 返回与输入相同的向量类型 | int8/uint8 返回 vecf32；f16/bf16 返回同类型 | 记录返回类型和值，待研发确认；浮点与整数分别断言。 |
-| VQ-050 | Feature 将 inner_product 描述为 dot product | 本机返回负点积，现有实现用于距离排序 | 同时记录标量数值与排序方向；符号以研发确认后的 Feature 契约为准，不能仅凭函数名作判断。 |
+| VQ-016/019 | 原 Feature 写整数量化支持全部度量 | L2/L2SQ 成功，IP/cosine/L1 拒绝 | [#31664](https://github.com/matrixorigin/matrixone/issues/31664) 研发确认实现为预期，原 Feature 表格待研发修正；整数基列无量化保留全部度量。 |
+| VQ-046/049 | 四种窄类型支持求和、范数及 subvector | 旧版本四种窄类型被拒绝 | [#31666](https://github.com/matrixorigin/matrixone/issues/31666) 确认产品缺陷，修复 PR #31775 已合入；需在新 main 直接回归，不能以合入代替通过。 |
+| VQ-047 | 原 Feature 写返回与输入相同的向量类型 | int8/uint8 返回 vecf32；f16/bf16 返回同类型 | [#31665](https://github.com/matrixorigin/matrixone/issues/31665) 研发确认实际行为为预期，按此分别断言。 |
+| VQ-050 | 原 Feature 将 inner_product 描述为 dot product | 返回负点积，作为距离用于排序 | [#31667](https://github.com/matrixorigin/matrixone/issues/31667) 研发确认负点积为预期，按数值及排序方向断言。 |
 | VQ-042 | 旧索引升级后仍可访问 | 旧数据升级当前 main 时 catalog admission 失败，升级后断言未执行，见 [#31649](https://github.com/matrixorigin/matrixone/issues/31649) | 测试已执行并发现阻塞 Issue；记录为“已执行、被 Issue 阻塞”，不是升级断言通过。修复后针对阻塞断言回归。 |
 | BVT 元数据 | 严格比较结果及元数据 | 部分失败与 JDBC 类型或测试器空结果解析有关；关闭元数据比对仅是诊断 | 分别记录严格结果与数值对照；定位工具/产品/预期原因后再修复或提 Issue，不把忽略元数据的结果记为严格通过。 |
 
